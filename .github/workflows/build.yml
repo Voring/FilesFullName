@@ -8,20 +8,37 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15-intel
+    env:
+      THEOS: ${{ github.workspace }}/theos
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install Theos
+      - name: Install build tools
+        run: brew install ldid xz make
+
+      - name: Install Theos (roothide scheme)
         run: |
-          brew install ldid xz
-          git clone --recursive https://github.com/theos/theos.git "$RUNNER_TEMP/theos"
-          git clone --depth 1 https://github.com/theos/sdks.git "$RUNNER_TEMP/theos/sdks"
-          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
-          echo "$RUNNER_TEMP/theos/bin" >> "$GITHUB_PATH"
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
+          mkdir -p "$THEOS/sdks"
+          cp -R /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
 
-      - name: Build package
-        run: make package FINALPACKAGE=1
+      - name: Build package (arm64e / roothide)
+        run: |
+          make clean
+          make package FINALPACKAGE=1
+
+      - name: Inspect product
+        run: |
+          ls -l packages
+          DYLIB=$(find .theos/obj -maxdepth 2 -name '*.dylib' | head -1)
+          echo "dylib: $DYLIB"
+          file "$DYLIB"
+          otool -hv "$DYLIB"
+          otool -L "$DYLIB"
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
