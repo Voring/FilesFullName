@@ -1,8 +1,7 @@
 TARGET := iphone:clang:16.5:15.0
 ARCHS = arm64e
 
-# RootHide / Dopamine (roothide) layout. Change to "rootless" if your device
-# runs a plain rootless jailbreak, or remove the line for rootful.
+# RootHide / Dopamine (roothide) layout.
 THEOS_PACKAGE_SCHEME = roothide
 
 include $(THEOS)/makefiles/common.mk
