@@ -2,7 +2,7 @@
 //  FilesFullName.x
 //  Show the complete file name in the Files app instead of "head…tail".
 //
-//  Target: iOS 15 / 16 Files app (com.apple.DocumentsApp), arm64, RootHide or rootless.
+//  Target: iOS 15 / 16 Files app (com.apple.DocumentsApp), arm64e, RootHide or rootless.
 //
 
 #import <UIKit/UIKit.h>
@@ -26,10 +26,10 @@ typedef struct {
     BOOL resizeRows;     // YES = 自动增高列表行以容纳多行文件名
     BOOL debugLog;
     NSInteger listMaxLines;  // 0 = 不限行数
-    NSInteger gridMaxLines;
+    NSInteger gridMaxLines;  // 0 = 不限行数
 } FEPrefs;
 
-static FEPrefs gPrefs = {YES, NO, NO, YES, NO, 0, 2};
+static FEPrefs gPrefs = {YES, YES, NO, YES, NO, 0, 2};
 
 #pragma mark - Preferences
 
@@ -85,7 +85,7 @@ static NSInteger FEPrefInt(NSString *key, NSInteger fallback)
 static void FELoadPrefs(void)
 {
     gPrefs.enabled = FEPrefBool(@"Enabled", YES);
-    gPrefs.gridEnabled = FEPrefBool(@"GridEnabled", NO);
+    gPrefs.gridEnabled = FEPrefBool(@"GridEnabled", YES);
     gPrefs.shrink = FEPrefBool(@"ShrinkToFit", NO);
     gPrefs.resizeRows = FEPrefBool(@"ResizeRows", YES);
     gPrefs.debugLog = FEPrefBool(@"DebugLog", NO);
@@ -93,7 +93,7 @@ static void FELoadPrefs(void)
     gPrefs.gridMaxLines = FEPrefInt(@"GridMaxLines", 2);
 
     if (gPrefs.listMaxLines < 0) gPrefs.listMaxLines = 0;
-    if (gPrefs.gridMaxLines < 1) gPrefs.gridMaxLines = 1;
+    if (gPrefs.gridMaxLines < 0) gPrefs.gridMaxLines = 0;
 
     FELog(@"prefs loaded: enabled=%d grid=%d shrink=%d resize=%d listLines=%ld gridLines=%ld",
           gPrefs.enabled, gPrefs.gridEnabled, gPrefs.shrink, gPrefs.resizeRows,
@@ -147,19 +147,63 @@ static Class FEClassWithNames(NSArray<NSString *> *names)
     return Nil;
 }
 
+#pragma mark - Managed labels
+
+// Every title label we touch is tagged with its desired maximum line count, so
+// later UIKit setters from the app can be intercepted and corrected.
+static const void *kFEFilenameLabelKey = &kFEFilenameLabelKey;
+
+static NSInteger FEDesiredLines(UILabel *label)
+{
+    NSNumber *number = objc_getAssociatedObject(label, kFEFilenameLabelKey);
+    return number ? number.integerValue : -1;
+}
+
+static void FESetDesiredLines(UILabel *label, NSInteger lines)
+{
+    objc_setAssociatedObject(label, kFEFilenameLabelKey, @(lines), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+/// Filename labels live inside a DOCItemCollection*Cell. Checked at setter
+/// time because the app may reset properties before our layout hook runs.
+static BOOL FELabelLivesInItemCell(UILabel *label)
+{
+    UIView *view = label.superview;
+    NSInteger depth = 0;
+    while (view && depth++ < 14) {
+        NSString *name = NSStringFromClass([view class]);
+        if ([name containsString:@"DOCItemCollection"] && [name containsString:@"Cell"]) {
+            return YES;
+        }
+        view = view.superview;
+    }
+    return NO;
+}
+
+static BOOL FEIsManagedLabel(UILabel *label)
+{
+    if (!gPrefs.enabled) {
+        return NO;
+    }
+    if (objc_getAssociatedObject(label, kFEFilenameLabelKey)) {
+        return YES;
+    }
+    return FELabelLivesInItemCell(label);
+}
+
 /// The label may render an attributed string whose paragraph style wins over
 /// -lineBreakMode:, so the paragraph style needs to be rewritten as well.
-static void FEFixParagraphStyle(UILabel *label, NSLineBreakMode mode)
+static NSAttributedString *FERewrittenAttributedText(NSAttributedString *attributed, NSLineBreakMode mode)
 {
-    NSAttributedString *attributed = label.attributedText;
     if (attributed.length == 0) {
-        return;
+        return attributed;
     }
     if ([attributed attribute:NSParagraphStyleAttributeName atIndex:0 effectiveRange:NULL] == nil) {
-        return;
+        return attributed;
     }
 
     NSMutableAttributedString *mutable = [attributed mutableCopy];
+    __block BOOL changed = NO;
     [attributed enumerateAttribute:NSParagraphStyleAttributeName
                             inRange:NSMakeRange(0, attributed.length)
                             options:0
@@ -168,18 +212,33 @@ static void FEFixParagraphStyle(UILabel *label, NSLineBreakMode mode)
         if (style.lineBreakMode != mode) {
             style.lineBreakMode = mode;
             [mutable addAttribute:NSParagraphStyleAttributeName value:style range:range];
+            changed = YES;
         }
     }];
-    label.attributedText = mutable;
+    return changed ? mutable : attributed;
 }
 
 #pragma mark - Label configuration
 
-static void FEApplyLabel(UILabel *label, NSInteger maxLines)
+static void FEFixAttributedTextInPlace(UILabel *label, NSLineBreakMode mode)
+{
+    NSAttributedString *current = label.attributedText;
+    if (current.length == 0) {
+        return;
+    }
+    NSAttributedString *fixed = FERewrittenAttributedText(current, mode);
+    if (fixed != current) {
+        label.attributedText = fixed;
+    }
+}
+
+static void FEConfigureLabel(UILabel *label, NSInteger maxLines)
 {
     if (!label || ![label isKindOfClass:[UILabel class]]) {
         return;
     }
+
+    FESetDesiredLines(label, maxLines);
 
     BOOL singleLine = gPrefs.shrink || maxLines == 1;
     NSInteger lines = singleLine ? 1 : maxLines;
@@ -197,7 +256,7 @@ static void FEApplyLabel(UILabel *label, NSInteger maxLines)
     if (singleLine && label.minimumScaleFactor < 0.5) {
         label.minimumScaleFactor = 0.5;
     }
-    FEFixParagraphStyle(label, mode);
+    FEFixAttributedTextInPlace(label, mode);
 }
 
 static UILabel *FEListTitleLabel(id cell)
@@ -232,28 +291,92 @@ static UILabel *FEGridTitleLabel(id cell)
     return nil;
 }
 
+#pragma mark - UILabel setters (protect against later resets by the app)
+
+static void (*orig_uilabel_setLineBreakMode)(id, SEL, NSLineBreakMode);
+static void (*orig_uilabel_setNumberOfLines)(id, SEL, NSInteger);
+static void (*orig_uilabel_setAttributedText)(id, SEL, NSAttributedString *);
+
+static void FEUILabelSetLineBreakMode(id self, SEL _cmd, NSLineBreakMode mode)
+{
+    if (mode == NSLineBreakByTruncatingMiddle && FEIsManagedLabel(self) && !gPrefs.shrink) {
+        mode = NSLineBreakByCharWrapping;
+    }
+    orig_uilabel_setLineBreakMode(self, _cmd, mode);
+}
+
+static void FEUILabelSetNumberOfLines(id self, SEL _cmd, NSInteger lines)
+{
+    if (FEIsManagedLabel(self) && !gPrefs.shrink) {
+        NSInteger desired = FEDesiredLines(self);
+        if (desired >= 0 && lines == 1) {
+            lines = desired;
+        }
+    }
+    orig_uilabel_setNumberOfLines(self, _cmd, lines);
+}
+
+static void FEUILabelSetAttributedText(id self, SEL _cmd, NSAttributedString *text)
+{
+    if (FEIsManagedLabel(self) && !gPrefs.shrink) {
+        text = FERewrittenAttributedText(text, NSLineBreakByCharWrapping);
+    }
+    orig_uilabel_setAttributedText(self, _cmd, text);
+}
+
 #pragma mark - Hooks: list view
 
 static void (*orig_listLayoutSubviews)(id, SEL);
+static void (*orig_listDidMoveToWindow)(id, SEL);
+static void (*orig_listUpdateConfiguration)(id, SEL, id);
+static void (*orig_listPrepareForReuse)(id, SEL);
 static CGSize (*orig_listSizeFitting)(id, SEL, CGSize, float, float);
+
+static void FEApplyToListCell(id cell)
+{
+    if (!gPrefs.enabled) {
+        return;
+    }
+    UILabel *label = FEListTitleLabel(cell);
+    if (!label) {
+        return;
+    }
+    if (!gPrefs.shrink) {
+        // Multiline labels need a known width before Auto Layout can compute
+        // their intrinsic height.
+        CGFloat width = label.bounds.size.width;
+        if (width > 1.0 && fabs(label.preferredMaxLayoutWidth - width) > 0.5) {
+            label.preferredMaxLayoutWidth = width;
+        }
+    }
+    FEConfigureLabel(label, gPrefs.listMaxLines);
+}
 
 static void FEListLayoutSubviews(id self, SEL _cmd)
 {
-    if (gPrefs.enabled && !gPrefs.shrink) {
-        UILabel *label = FEListTitleLabel(self);
-        if (label) {
-            // Multiline labels need a known width before Auto Layout can
-            // compute their intrinsic height.
-            CGFloat width = label.bounds.size.width;
-            if (width > 1.0 && fabs(label.preferredMaxLayoutWidth - width) > 0.5) {
-                label.preferredMaxLayoutWidth = width;
-            }
-            FEApplyLabel(label, gPrefs.listMaxLines);
-        }
-    } else if (gPrefs.enabled) {
-        FEApplyLabel(FEListTitleLabel(self), 1);
-    }
+    FEApplyToListCell(self);
     orig_listLayoutSubviews(self, _cmd);
+    // Some builds re-apply their title configuration during layout; win the
+    // last word here as well.
+    FEApplyToListCell(self);
+}
+
+static void FEListDidMoveToWindow(id self, SEL _cmd)
+{
+    orig_listDidMoveToWindow(self, _cmd);
+    FEApplyToListCell(self);
+}
+
+static void FEListUpdateConfiguration(id self, SEL _cmd, id state)
+{
+    orig_listUpdateConfiguration(self, _cmd, state);
+    FEApplyToListCell(self);
+}
+
+static void FEListPrepareForReuse(id self, SEL _cmd)
+{
+    orig_listPrepareForReuse(self, _cmd);
+    FEApplyToListCell(self);
 }
 
 static CGFloat FEAvailableTextWidth(id cell, UILabel *label, CGFloat proposedWidth)
@@ -310,28 +433,53 @@ static CGSize FEListSizeFitting(id self, SEL _cmd, CGSize size, float horizontal
 #pragma mark - Hooks: grid view
 
 static void (*orig_gridLayoutSubviews)(id, SEL);
+static void (*orig_gridDidMoveToWindow)(id, SEL);
+static void (*orig_gridUpdateConfiguration)(id, SEL, id);
+static void (*orig_gridPrepareForReuse)(id, SEL);
+
+static void FEApplyToGridCell(id cell)
+{
+    if (!gPrefs.enabled || !gPrefs.gridEnabled) {
+        return;
+    }
+    FEConfigureLabel(FEGridTitleLabel(cell), gPrefs.gridMaxLines);
+}
 
 static void FEGridLayoutSubviews(id self, SEL _cmd)
 {
-    if (gPrefs.enabled && gPrefs.gridEnabled) {
-        UILabel *label = FEGridTitleLabel(self);
-        if (label) {
-            FEApplyLabel(label, gPrefs.gridMaxLines);
-        }
-    }
+    FEApplyToGridCell(self);
     orig_gridLayoutSubviews(self, _cmd);
+    FEApplyToGridCell(self);
+}
+
+static void FEGridDidMoveToWindow(id self, SEL _cmd)
+{
+    orig_gridDidMoveToWindow(self, _cmd);
+    FEApplyToGridCell(self);
+}
+
+static void FEGridUpdateConfiguration(id self, SEL _cmd, id state)
+{
+    orig_gridUpdateConfiguration(self, _cmd, state);
+    FEApplyToGridCell(self);
+}
+
+static void FEGridPrepareForReuse(id self, SEL _cmd)
+{
+    orig_gridPrepareForReuse(self, _cmd);
+    FEApplyToGridCell(self);
 }
 
 #pragma mark - Install
 
-static BOOL FEHookClass(Class cls, SEL selector, IMP replacement, IMP *original, const char *what)
+static BOOL FEHookMethod(Class cls, SEL selector, IMP replacement, IMP *original, const char *what)
 {
     if (!cls) {
         return NO;
     }
     Method method = class_getInstanceMethod(cls, selector);
     if (!method) {
-        FELog(@"%@ is missing -%s", NSStringFromClass(cls), sel_getName(selector));
+        NSLog(@"[FilesFullName] %@ has no -%s (%s)", NSStringFromClass(cls), sel_getName(selector), what);
         return NO;
     }
     MSHookMessageEx(cls, selector, replacement, original);
@@ -359,18 +507,40 @@ __attribute__((constructor)) static void FEInitialize(void)
                                         @"DocumentManagerExecutables.DOCItemCollectionGridCell",
                                         @"DOCItemCollectionGridCell"]);
 
-    if (!listCell) {
-        NSLog(@"[FilesFullName] list cell class not found; tweak inactive.");
-    }
-    if (!gridCell) {
-        FELog(@"grid cell class not found; grid titles untouched.");
-    }
+    NSLog(@"[FilesFullName] loaded. listCell=%@ gridCell=%@",
+          listCell ? NSStringFromClass(listCell) : @"(nil)",
+          gridCell ? NSStringFromClass(gridCell) : @"(nil)");
 
-    FEHookClass(listCell, @selector(layoutSubviews), (IMP)&FEListLayoutSubviews, (IMP *)&orig_listLayoutSubviews, "list layout");
-    FEHookClass(listCell, @selector(systemLayoutSizeFittingSize:withHorizontalFittingPriority:verticalFittingPriority:),
-                (IMP)&FEListSizeFitting, (IMP *)&orig_listSizeFitting, "list sizing");
+    // Protect the title labels against setters the app may call later.
+    Class labelClass = [UILabel class];
+    FEHookMethod(labelClass, @selector(setLineBreakMode:), (IMP)&FEUILabelSetLineBreakMode,
+                 (IMP *)&orig_uilabel_setLineBreakMode, "label line break");
+    FEHookMethod(labelClass, @selector(setNumberOfLines:), (IMP)&FEUILabelSetNumberOfLines,
+                 (IMP *)&orig_uilabel_setNumberOfLines, "label number of lines");
+    FEHookMethod(labelClass, @selector(setAttributedText:), (IMP)&FEUILabelSetAttributedText,
+                 (IMP *)&orig_uilabel_setAttributedText, "label attributed text");
+
+    if (listCell) {
+        FEHookMethod(listCell, @selector(layoutSubviews), (IMP)&FEListLayoutSubviews,
+                     (IMP *)&orig_listLayoutSubviews, "list layout");
+        FEHookMethod(listCell, @selector(didMoveToWindow), (IMP)&FEListDidMoveToWindow,
+                     (IMP *)&orig_listDidMoveToWindow, "list window");
+        FEHookMethod(listCell, @selector(_bridgedUpdateConfigurationUsingState:), (IMP)&FEListUpdateConfiguration,
+                     (IMP *)&orig_listUpdateConfiguration, "list configuration");
+        FEHookMethod(listCell, @selector(prepareForReuse), (IMP)&FEListPrepareForReuse,
+                     (IMP *)&orig_listPrepareForReuse, "list reuse");
+        FEHookMethod(listCell, @selector(systemLayoutSizeFittingSize:withHorizontalFittingPriority:verticalFittingPriority:),
+                     (IMP)&FEListSizeFitting, (IMP *)&orig_listSizeFitting, "list sizing");
+    }
 
     if (gridCell) {
-        FEHookClass(gridCell, @selector(layoutSubviews), (IMP)&FEGridLayoutSubviews, (IMP *)&orig_gridLayoutSubviews, "grid layout");
+        FEHookMethod(gridCell, @selector(layoutSubviews), (IMP)&FEGridLayoutSubviews,
+                     (IMP *)&orig_gridLayoutSubviews, "grid layout");
+        FEHookMethod(gridCell, @selector(didMoveToWindow), (IMP)&FEGridDidMoveToWindow,
+                     (IMP *)&orig_gridDidMoveToWindow, "grid window");
+        FEHookMethod(gridCell, @selector(_bridgedUpdateConfigurationUsingState:), (IMP)&FEGridUpdateConfiguration,
+                     (IMP *)&orig_gridUpdateConfiguration, "grid configuration");
+        FEHookMethod(gridCell, @selector(prepareForReuse), (IMP)&FEGridPrepareForReuse,
+                     (IMP *)&orig_gridPrepareForReuse, "grid reuse");
     }
 }
