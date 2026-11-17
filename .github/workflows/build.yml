@@ -24,14 +24,16 @@ jobs:
 
       - name: Install Theos (roothide fork) and iPhoneOS 16.5 SDK
         run: |
-          git clone https://github.com/roothide/theos.git "$THEOS"
-          git -C "$THEOS" submodule update --init --recursive
-          git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
-          mkdir -p "$THEOS/sdks"
-          cp -R /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
-          echo "$THEOS/bin" >> "$GITHUB_PATH"
-          ls "$THEOS/makefiles/package/schemes"
-          ls "$THEOS/sdks"
+          set -o pipefail
+          {
+            git clone --depth 1 https://github.com/roothide/theos.git "$THEOS"
+            git -C "$THEOS" submodule update --init --recursive || echo "submodules partially unavailable, continuing"
+            git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
+            mkdir -p "$THEOS/sdks"
+            cp -R /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+            echo "$THEOS/bin" >> "$GITHUB_PATH"
+            ls "$THEOS/makefiles/package/schemes" || true
+          } 2>&1 | tee install.log
 
       - name: Build package
         run: |
@@ -43,9 +45,12 @@ jobs:
         run: |
           if [ -f build.log ]; then
             tail -c 1200 build.log | tr '\n' ' ' > /tmp/msg
-            echo "::error::$(cat /tmp/msg)"
+            echo "::error::BUILD: $(cat /tmp/msg)"
+          elif [ -f install.log ]; then
+            tail -c 1200 install.log | tr '\n' ' ' > /tmp/msg
+            echo "::error::INSTALL: $(cat /tmp/msg)"
           else
-            echo "::error::build.log missing, make never produced output"
+            echo "::error::no log produced"
           fi
 
       - name: Inspect product
