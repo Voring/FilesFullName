@@ -6,12 +6,12 @@
 //
 //  Design notes:
 //  - Never touch Swift ivars; every element is found by walking the view tree.
-//  - No layoutSubviews hook: mutating views there made the Swift list cell
-//    hit an assertion and crash. Row growth uses the two sizing methods only.
+//  - No layoutSubviews hook, no constraint surgery: both crashed or wrecked
+//    the cell layout. Row growth uses the two sizing methods only, and icons
+//    are kept at natural size with aspect-fit.
 //  - Only two surfaces are touched: list/grid cell title labels, and the
 //    center filename under the large preview icon. Everything else keeps the
 //    system layout.
-//  - File-type icons are clamped back to square size off the layout pass.
 //  - Silent load: no alert.
 //
 
@@ -141,8 +141,7 @@ static BOOL FEIsNavAncestor(UIView *view)
     for (NSInteger depth = 0; current && depth < 12; depth++, current = current.superview) {
         NSString *name = NSStringFromClass([current class]);
         if ([name containsString:@"NavigationBar"] || [name containsString:@"NavBar"] ||
-            [name containsString:@"Toolbar"] || [name containsString:@"TabBar"] ||
-            [name containsString:@"Button"]) {
+            [name containsString:@"Toolbar"] || [name containsString:@"TabBar"]) {
             return YES;
         }
     }
@@ -230,44 +229,21 @@ static NSAttributedString *PERewrite(NSAttributedString *attributed, NSLineBreak
 
 #pragma mark - Icon size
 
-static void FEMakeSquare(UIView *icon)
+/// Keep the icon at its natural size without touching any constraint: a
+/// stretched image view switches to aspect-fit, so the artwork is drawn at its
+/// original square size and simply centered inside the taller frame.
+static void FEKeepIconNaturalSize(UIView *icon)
 {
-    CGRect frame = icon.frame;
-    if (!(frame.size.height > frame.size.width + 1.0 && frame.size.width > 8.0)) return;
+    if (![icon isKindOfClass:[UIImageView class]]) return;
 
-    CGFloat centerY = CGRectGetMidY(frame);
-    frame.size.height = frame.size.width;
-    frame.origin.y = centerY - frame.size.height / 2.0;
-    icon.frame = frame;
-
-    // Autolayout would stretch the icon again on the next pass: drop any
-    // height constraint pinned to the icon and add an equal-width constraint.
-    NSMutableArray<NSLayoutConstraint *> *heightConstraints = [NSMutableArray array];
-    for (NSLayoutConstraint *c in icon.constraints) {
-        if (c.firstItem == icon && c.firstAttribute == NSLayoutAttributeHeight) {
-            [heightConstraints addObject:c];
+    UIImageView *imageView = (UIImageView *)icon;
+    CGRect frame = imageView.frame;
+    if (frame.size.height > frame.size.width + 1.0 && frame.size.width > 8.0) {
+        if (imageView.contentMode != UIViewContentModeScaleAspectFit) {
+            imageView.contentMode = UIViewContentModeScaleAspectFit;
         }
+        if (!imageView.clipsToBounds) imageView.clipsToBounds = YES;
     }
-    for (NSLayoutConstraint *c in icon.superview.constraints) {
-        BOOL pinsIconHeight = (c.firstItem == icon && c.firstAttribute == NSLayoutAttributeHeight) ||
-                              (c.secondItem == icon && c.secondAttribute == NSLayoutAttributeHeight);
-        if (pinsIconHeight) [heightConstraints addObject:c];
-    }
-    for (NSLayoutConstraint *c in heightConstraints) {
-        if (c.firstItem == icon) {
-            [icon removeConstraint:c];
-        } else {
-            [icon.superview removeConstraint:c];
-        }
-    }
-
-    NSLayoutConstraint *square = [NSLayoutConstraint constraintWithItem:icon
-                                                              attribute:NSLayoutAttributeWidth
-                                                              relatedBy:NSLayoutRelationEqual
-                                                                 toItem:icon
-                                                              attribute:NSLayoutAttributeHeight
-                                                             multiplier:1.0 constant:0];
-    square.active = YES;
 }
 
 static void FEClampIconSize(UIView *cell)
@@ -279,7 +255,7 @@ static void FEClampIconSize(UIView *cell)
     for (UIView *icon in icons) {
         if ([icon isKindOfClass:[UILabel class]]) continue;
         if (icon.subviews.count > 0) continue;
-        FEMakeSquare(icon);
+        FEKeepIconNaturalSize(icon);
     }
 }
 
@@ -422,7 +398,7 @@ static CGSize FECellSizing(id self, SEL _cmd, CGSize size, float hPriority, floa
 
 __attribute__((constructor)) static void FEInitialize(void)
 {
-    FELog(@"loaded (v0.0.13)");
+    FELog(@"loaded (v0.0.15)");
     FELoadPrefs();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, FEPrefsChanged,

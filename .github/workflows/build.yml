@@ -77,14 +77,15 @@ jobs:
         if: success() && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.0.14
-          name: FilesFullName 0.0.14
+          tag_name: v0.0.15
+          name: FilesFullName 0.0.15
           body: |
             arm64e / roothide（RootHide、Dopamine）构建，iOS 15-16。
 
-            - 列表文件名换行；图标固定原始方形尺寸（移除高度约束并加宽=高约束）
-            - 详情页大图标下方的中间文件名换行；大图标识别兼容非 UIImageView 子类
-            - 补挂 setText: 钩子，纯文本设置不会冲掉换行状态
+            - 回退约束手术：不再删高度约束，避免图标被压成极小点
+            - 图标改为等比缩放（aspect-fit），图像按原尺寸居中渲染
+            - 放宽详情页识别：不再因为祖先含 Button 就跳过，修复详情页中间名字仍省略的问题
+            - 列表文件名换行、行高自适应不变
             - 其余界面保持系统原样；加载静默无弹窗
             - 偏好键：Enabled / ShrinkToFit / WrapLines / KeepIconSize / ListMaxLines
           files: packages/*.deb
