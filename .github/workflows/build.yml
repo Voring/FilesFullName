@@ -77,14 +77,15 @@ jobs:
         if: success() && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.0.8
-          name: FilesFullName 0.0.8
+          tag_name: v0.0.9
+          name: FilesFullName 0.0.9
           body: |
             arm64e / roothide（RootHide、Dopamine）构建，iOS 15-16。
 
             - 注入 com.apple.DocumentsApp（系统「文件」App）
             - 长文件名不再是「名称头…名称尾」，改为按字符换行
             - 列表行高随内容自动增高，列表不限行数，网格默认 2 行
+            - 0.0.9 为诊断版：加载弹窗会列出解析到的 Cell 类名与标题标签信息
             - 偏好键：Enabled / GridEnabled / ShrinkToFit / ResizeRows / ListMaxLines / GridMaxLines / ShowLoadAlert
             - 安装后 respring，打开「文件」App 会出现一次 FilesFullName 加载确认框
           files: packages/*.deb
