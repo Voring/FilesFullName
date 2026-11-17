@@ -19,37 +19,47 @@ jobs:
 
       - name: Install build tools
         run: |
-          brew install ldid xz make || true
-          echo "ldid: $(command -v ldid || echo none)"
+          brew install ldid xz make dpkg || true
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
 
-      - name: Install Theos + iPhoneOS 16.5 SDK
+      - name: Install Theos and iPhoneOS 16.5 SDK
         run: |
-          git clone --depth 1 --recursive https://github.com/theos/theos.git "$THEOS"
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
           git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
           mkdir -p "$THEOS/sdks"
           cp -R /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
-          ls "$THEOS/sdks"
           echo "$THEOS/bin" >> "$GITHUB_PATH"
-
-      - name: Show environment
-        run: |
-          echo "theos: $THEOS"
           ls "$THEOS/makefiles" | head -5
-          cat control
+          ls "$THEOS/sdks"
 
-      - name: Build package (arm64e / roothide)
+      - name: Build package
         run: |
-          make clean || true
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide ARCHS=arm64e
+          set -o pipefail
+          make package FINALPACKAGE=1 2>&1 | tee build.log
+
+      - name: Report build error
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            tail -c 1200 build.log | tr '\n' ' ' > /tmp/msg
+            echo "::error::$(cat /tmp/msg)"
+          else
+            echo "::error::build.log missing, make never produced output"
+          fi
 
       - name: Inspect product
+        if: success()
         run: |
           ls -l packages
           DYLIB=$(find .theos -name '*.dylib' -type f | head -1)
           echo "dylib: $DYLIB"
-          if [ -n "$DYLIB" ]; then file "$DYLIB"; otool -hv "$DYLIB"; otool -L "$DYLIB"; fi
+          if [ -n "$DYLIB" ]; then
+            file "$DYLIB"
+            otool -hv "$DYLIB"
+          fi
 
-      - name: Upload deb artifact
+      - name: Upload deb
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: FilesFullName-deb
@@ -57,20 +67,18 @@ jobs:
           if-no-files-found: error
 
       - name: Publish release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="v0.0.8"
-          NOTES="FilesFullName 0.0.8（arm64e / roothide / iOS 15-16）
+        if: success() && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.0.8
+          name: FilesFullName 0.0.8
+          body: |
+            arm64e / roothide（RootHide、Dopamine）构建，iOS 15-16。
 
-- 注入 com.apple.DocumentsApp（系统「文件」App）
-- 长文件名不再「名称头…名称尾」，改为按字符换行，列表行高自动增高
-- 列表视图不限行数，网格视图默认 2 行
-- 偏好：Enabled / GridEnabled / ShrinkToFit / ResizeRows / ListMaxLines / GridMaxLines / ShowLoadAlert
-- 装上后 respring，打开「文件」App 会弹一次 FilesFullName 加载确认框"
-          gh release create "$TAG" packages/*.deb \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "FilesFullName 0.0.8" \
-            --notes "$NOTES" \
-          || gh release upload "$TAG" packages/*.deb --repo "$GITHUB_REPOSITORY" --clobber
+            - 注入 com.apple.DocumentsApp（系统「文件」App）
+            - 长文件名不再是「名称头…名称尾」，改为按字符换行
+            - 列表行高随内容自动增高，列表不限行数，网格默认 2 行
+            - 偏好键：Enabled / GridEnabled / ShrinkToFit / ResizeRows / ListMaxLines / GridMaxLines / ShowLoadAlert
+            - 安装后 respring，打开「文件」App 会出现一次 FilesFullName 加载确认框
+          files: packages/*.deb
+          fail_on_unmatched_files: true
