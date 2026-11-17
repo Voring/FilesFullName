@@ -33,10 +33,11 @@ typedef struct {
     BOOL wrap;
     BOOL resizeRows;
     BOOL keepIconSize;
+    BOOL dumpToDownloads;
     NSInteger maxLines;
 } FEPrefs;
 
-static FEPrefs gPrefs = {YES, NO, YES, YES, YES, 0};
+static FEPrefs gPrefs = {YES, NO, YES, YES, YES, YES, 0};
 
 #pragma mark - Preferences
 
@@ -79,6 +80,7 @@ static void FELoadPrefs(void)
     gPrefs.wrap = FEPrefBool(@"WrapLines", YES);
     gPrefs.resizeRows = FEPrefBool(@"ResizeRows", YES);
     gPrefs.keepIconSize = FEPrefBool(@"KeepIconSize", YES);
+    gPrefs.dumpToDownloads = FEPrefBool(@"DumpToDownloads", YES);
     gPrefs.maxLines = FEPrefInt(@"ListMaxLines", 0);
     if (gPrefs.maxLines < 0) gPrefs.maxLines = 0;
 }
@@ -353,7 +355,28 @@ static void FEDumpTree(UIView *root)
          NSStringFromCGRect(imageView.frame), (long)imageView.contentMode];
     }
 
-    [dump writeToFile:kTreeDumpFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    // Every non-label view that carries drawn content, so a SwiftUI or custom
+    // drawn title can be identified by class name and size.
+    NSMutableArray<UIView *> *views = [NSMutableArray array];
+    FECollectViews(root, [UIView class], views, 0);
+    for (UIView *view in views) {
+        if (view.layer.contents || view.subviews.count == 0) {
+            [dump appendFormat:@"VIEW %@ frame=%@ layerContents=%d\n",
+             NSStringFromClass([view class]),
+             NSStringFromCGRect(view.frame), view.layer.contents != nil];
+        }
+    }
+
+    NSArray<NSString *> *paths = @[kTreeDumpFile];
+    NSString *documents = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                             NSUserDomainMask, YES) firstObject];
+    NSMutableArray<NSString *> *extra = [NSMutableArray array];
+    if (documents.length) [extra addObject:[documents stringByAppendingPathComponent:@"tree.txt"]];
+    if (gPrefs.dumpToDownloads) [extra addObject:@"/var/mobile/Downloads/tree.txt"];
+    if (extra.count) paths = [extra arrayByAddingObject:kTreeDumpFile];
+    for (NSString *path in paths) {
+        [dump writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
 }
 
 static void FERescanVisible(void)
@@ -483,7 +506,7 @@ static void FEViewDidAppear(id self, SEL _cmd, BOOL animated)
 
 __attribute__((constructor)) static void FEInitialize(void)
 {
-    FELog(@"loaded (v0.0.18)");
+    FELog(@"loaded (v0.0.19)");
     FELoadPrefs();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, FEPrefsChanged,
