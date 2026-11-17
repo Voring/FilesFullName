@@ -2,7 +2,10 @@
 //  FilesFullName.x
 //  Show the complete file name in the Files app instead of "head…tail".
 //
-//  Target: iOS 15 / 16 Files app (com.apple.DocumentsApp), arm64e, RootHide / rootless.
+//  iOS 15 / 16, com.apple.DocumentsApp, arm64e (RootHide / rootless).
+//
+//  No Swift ivar access: everything is found by walking the view tree, so the
+//  tweak can never read a bogus offset and crash the app.
 //
 
 #import <UIKit/UIKit.h>
@@ -17,22 +20,15 @@ static NSString *const kPrefsFile = @"/var/mobile/Library/Preferences/com.voring
 typedef struct {
     BOOL enabled;
     BOOL gridEnabled;
-    BOOL shrink;        // YES = 单行缩字号；NO = 多行换行
+    BOOL shrink;
+    BOOL wrap;
     BOOL resizeRows;
     BOOL showAlert;
-    NSInteger listMaxLines;   // 0 = 不限
-    NSInteger gridMaxLines;
+    NSInteger maxLines;
 } FEPrefs;
 
-static FEPrefs gPrefs = {YES, YES, NO, YES, YES, 0, 2};
-
-static NSMutableString *gDiag = nil;
-static NSUInteger gDiagCellCount = 0;
-static void FEAddDiag(NSString *s)
-{
-    if (!gDiag) gDiag = [NSMutableString string];
-    [gDiag appendString:s ?: @""];
-}
+static FEPrefs gPrefs = {YES, YES, NO, YES, YES, YES, 0};
+static NSUInteger gConfiguredCount = 0;
 
 #pragma mark - Preferences
 
@@ -43,7 +39,6 @@ static id FEPrefCopyValue(NSString *key)
     if (value) {
         return value;
     }
-
     static NSArray<NSString *> *paths;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -77,16 +72,11 @@ static void FELoadPrefs(void)
     gPrefs.enabled = FEPrefBool(@"Enabled", YES);
     gPrefs.gridEnabled = FEPrefBool(@"GridEnabled", YES);
     gPrefs.shrink = FEPrefBool(@"ShrinkToFit", NO);
+    gPrefs.wrap = FEPrefBool(@"WrapLines", YES);
     gPrefs.resizeRows = FEPrefBool(@"ResizeRows", YES);
     gPrefs.showAlert = FEPrefBool(@"ShowLoadAlert", YES);
-    gPrefs.listMaxLines = FEPrefInt(@"ListMaxLines", 0);
-    gPrefs.gridMaxLines = FEPrefInt(@"GridMaxLines", 2);
-    if (gPrefs.listMaxLines < 0) gPrefs.listMaxLines = 0;
-    if (gPrefs.gridMaxLines < 0) gPrefs.gridMaxLines = 0;
-
-    FELog(@"prefs: enabled=%d grid=%d shrink=%d resize=%d list=%ld grid=%ld",
-          gPrefs.enabled, gPrefs.gridEnabled, gPrefs.shrink, gPrefs.resizeRows,
-          (long)gPrefs.listMaxLines, (long)gPrefs.gridMaxLines);
+    gPrefs.maxLines = FEPrefInt(@"ListMaxLines", 0);
+    if (gPrefs.maxLines < 0) gPrefs.maxLines = 0;
 }
 
 static void FEPrefsChanged(CFNotificationCenterRef center, void *observer,
@@ -95,40 +85,8 @@ static void FEPrefsChanged(CFNotificationCenterRef center, void *observer,
     FELoadPrefs();
 }
 
-#pragma mark - Runtime helpers
+#pragma mark - Hooking
 
-static id FEIvarValue(id object, NSString *name)
-{
-    Class cls = object_getClass(object);
-    while (cls) {
-        Ivar ivar = class_getInstanceVariable(cls, name.UTF8String);
-        if (ivar) {
-            return (ivar_getTypeEncoding(ivar)[0] == '@') ? object_getIvar(object, ivar) : nil;
-        }
-        cls = class_getSuperclass(cls);
-    }
-    return nil;
-}
-
-static UILabel *FEIvarLabel(id object, NSString *name)
-{
-    id value = FEIvarValue(object, name);
-    return [value isKindOfClass:[UILabel class]] ? value : nil;
-}
-
-static Class FEClassWithNames(NSArray<NSString *> *names)
-{
-    for (NSString *name in names) {
-        Class cls = NSClassFromString(name);
-        if (cls) {
-            return cls;
-        }
-    }
-    return Nil;
-}
-
-/// Substrate-free hooking. Pointers are taken as void * so that the many
-/// differently-typed IMPs we install never trip clang's pointer type checks.
 static BOOL FEHook(Class cls, SEL selector, void *replacement, void **original, NSString *tag)
 {
     if (!cls) {
@@ -151,39 +109,64 @@ static BOOL FEHook(Class cls, SEL selector, void *replacement, void **original, 
     return YES;
 }
 
-#pragma mark - Label state
+#pragma mark - View tree helpers
 
-static const void *kFEFilenameLabelKey = &kFEFilenameLabelKey;
-
-static BOOL FEIsItemCellLabel(UILabel *label)
+static BOOL FEIsInsideCell(UIView *view)
 {
-    UIView *view = label.superview;
-    for (NSInteger depth = 0; view && depth < 14; depth++, view = view.superview) {
-        NSString *name = NSStringFromClass([view class]);
-        if ([name containsString:@"DOCItemCollection"] && [name containsString:@"Cell"]) {
+    UIView *current = view;
+    for (NSInteger depth = 0; current && depth < 12; depth++, current = current.superview) {
+        NSString *name = NSStringFromClass([current class]);
+        if ([name containsString:@"Cell"] || [name containsString:@"Row"]) {
             return YES;
         }
     }
     return NO;
 }
 
-static BOOL FEIsManagedLabel(UILabel *label)
+static void FECollectLabels(UIView *view, NSMutableArray<UILabel *> *into, NSInteger depth)
 {
-    if (!gPrefs.enabled) {
-        return NO;
+    if (!view || depth > 10) {
+        return;
     }
-    if (objc_getAssociatedObject(label, kFEFilenameLabelKey)) {
-        return YES;
+    if ([view isKindOfClass:[UILabel class]]) {
+        [into addObject:(UILabel *)view];
     }
-    return FEIsItemCellLabel(label);
+    for (UIView *child in view.subviews) {
+        FECollectLabels(child, into, depth + 1);
+    }
 }
 
-static NSAttributedString *FERewriteAttributedText(NSAttributedString *attributed, NSLineBreakMode mode)
+/// The filing card's file-name label is the widest label in the cell.
+static UILabel *FETitleLabel(UIView *cell)
+{
+    NSMutableArray<UILabel *> *labels = [NSMutableArray array];
+    FECollectLabels(cell, labels, 0);
+
+    UILabel *best = nil;
+    CGFloat bestWidth = 0;
+    for (UILabel *label in labels) {
+        if (label.hidden || label.alpha < 0.05) {
+            continue;
+        }
+        NSString *text = label.text.length ? label.text : label.attributedText.string;
+        if (text.length == 0) {
+            continue;
+        }
+        CGFloat width = label.bounds.size.width;
+        if (width <= 1.0) {
+            width = label.frame.size.width;
+        }
+        if (width > bestWidth) {
+            bestWidth = width;
+            best = label;
+        }
+    }
+    return best;
+}
+
+static NSAttributedString *PERewrite(NSAttributedString *attributed, NSLineBreakMode mode)
 {
     if (attributed.length == 0) {
-        return attributed;
-    }
-    if (![attributed attribute:NSParagraphStyleAttributeName atIndex:0 effectiveRange:NULL]) {
         return attributed;
     }
     NSMutableAttributedString *mutable = [attributed mutableCopy];
@@ -202,61 +185,34 @@ static NSAttributedString *FERewriteAttributedText(NSAttributedString *attribute
     return changed ? mutable : attributed;
 }
 
-static UILabel *FEListTitleLabel(id cell);
-static UILabel *FEGridTitleLabel(id cell);
-
-static void FEConfigureLabel(UILabel *label, NSInteger maxLines)
+static void FEConfigureLabel(UILabel *label)
 {
-    if (!label) {
+    if (!label || !gPrefs.enabled) {
         return;
     }
-    objc_setAssociatedObject(label, kFEFilenameLabelKey, @(maxLines), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    BOOL singleLine = gPrefs.shrink || maxLines == 1;
-    NSInteger lines = singleLine ? 1 : maxLines;
+    BOOL singleLine = gPrefs.shrink || !gPrefs.wrap;
+    NSInteger lines = singleLine ? 1 : gPrefs.maxLines;
     NSLineBreakMode mode = singleLine ? NSLineBreakByTruncatingTail : NSLineBreakByCharWrapping;
 
     if (label.numberOfLines != lines) label.numberOfLines = lines;
     if (label.lineBreakMode != mode) label.lineBreakMode = mode;
     if (label.adjustsFontSizeToFitWidth != singleLine) label.adjustsFontSizeToFitWidth = singleLine;
-    if (singleLine && label.minimumScaleFactor < 0.5) label.minimumScaleFactor = 0.5;
+    if (singleLine && label.minimumScaleFactor < 0.4) label.minimumScaleFactor = 0.4;
+
+    CGFloat width = label.bounds.size.width;
+    if (width > 1.0 && fabs(label.preferredMaxLayoutWidth - width) > 0.5) {
+        label.preferredMaxLayoutWidth = width;
+    }
 
     NSAttributedString *text = label.attributedText;
     if (text.length) {
-        NSAttributedString *fixed = FERewriteAttributedText(text, mode);
+        NSAttributedString *fixed = PERewrite(text, mode);
         if (fixed != text) label.attributedText = fixed;
     }
+    gConfiguredCount++;
 }
 
-static UILabel *FEListTitleLabel(id cell)
-{
-    static NSArray<NSString *> *names;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        names = @[@"listTitleLabel", @"titleLabel", @"gridTitleLabel"];
-    });
-    for (NSString *name in names) {
-        UILabel *label = FEIvarLabel(cell, name);
-        if (label) return label;
-    }
-    return nil;
-}
-
-static UILabel *FEGridTitleLabel(id cell)
-{
-    static NSArray<NSString *> *names;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        names = @[@"gridTitleLabel", @"titleLabel", @"listTitleLabel"];
-    });
-    for (NSString *name in names) {
-        UILabel *label = FEIvarLabel(cell, name);
-        if (label) return label;
-    }
-    return nil;
-}
-
-#pragma mark - UILabel setters (protect against later resets)
+#pragma mark - UILabel setters
 
 static void (*orig_setLineBreakMode)(id, SEL, NSLineBreakMode);
 static void (*orig_setNumberOfLines)(id, SEL, NSInteger);
@@ -264,208 +220,115 @@ static void (*orig_setAttributedText)(id, SEL, NSAttributedString *);
 
 static void FESetLineBreakMode(id self, SEL _cmd, NSLineBreakMode mode)
 {
-    if (mode == NSLineBreakByTruncatingMiddle && FEIsManagedLabel(self) && !gPrefs.shrink) {
-        mode = NSLineBreakByCharWrapping;
-    }
     orig_setLineBreakMode(self, _cmd, mode);
+    if (mode == NSLineBreakByTruncatingMiddle && FEIsInsideCell(self) && !gPrefs.shrink && gPrefs.enabled) {
+        FEConfigureLabel((UILabel *)self);
+    }
 }
 
 static void FESetNumberOfLines(id self, SEL _cmd, NSInteger lines)
 {
-    if (FEIsManagedLabel(self) && !gPrefs.shrink && lines == 1) {
-        NSNumber *desired = objc_getAssociatedObject(self, kFEFilenameLabelKey);
-        if (desired) {
-            lines = desired.integerValue;
-        }
-    }
     orig_setNumberOfLines(self, _cmd, lines);
+    if (lines == 1 && FEIsInsideCell(self) && !gPrefs.shrink && gPrefs.wrap && gPrefs.enabled) {
+        FEConfigureLabel((UILabel *)self);
+    }
 }
 
 static void FESetAttributedText(id self, SEL _cmd, NSAttributedString *text)
 {
-    if (FEIsManagedLabel(self) && !gPrefs.shrink) {
-        text = FERewriteAttributedText(text, NSLineBreakByCharWrapping);
+    if (FEIsInsideCell(self) && !gPrefs.shrink && gPrefs.enabled && text.length) {
+        text = PERewrite(text, NSLineBreakByCharWrapping);
     }
     orig_setAttributedText(self, _cmd, text);
 }
 
-#pragma mark - Cell diagnostics
+#pragma mark - Cell layout
 
-static void FEDumpCell(id cell)
+static void (*orig_cellLayout)(id, SEL);
+static id (*orig_preferredAttrs)(id, SEL, id);
+static CGSize (*orig_cellSizing)(id, SEL, CGSize, float, float);
+
+static CGFloat FEHeightDelta(UIView *cell, CGFloat width)
 {
-    if (gDiagCellCount >= 4) return;
-    gDiagCellCount++;
-
-    NSMutableArray *out = [NSMutableArray array];
-    unsigned int ivarCount = 0;
-    Ivar *ivars = class_copyIvarList(object_getClass(cell), &ivarCount);
-    for (unsigned i = 0; i < ivarCount; i++) {
-        Ivar v = ivars[i];
-        id val = object_getIvar(cell, v);
-        if ([val isKindOfClass:[UILabel class]]) {
-            UILabel *l = val;
-            NSString *txt = l.text.length ? l.text : l.attributedText.string;
-            NSString *head = txt.length ? [txt substringToIndex:MIN(12, txt.length)] : @"";
-            [out addObject:[NSString stringWithFormat:@"L[%s] lines=%ld brk=%ld w=%.0f t=%@",
-                            ivar_getName(v), (long)l.numberOfLines, (long)l.lineBreakMode,
-                            l.bounds.size.width, head]];
-        }
+    UILabel *label = FETitleLabel(cell);
+    if (!label) {
+        return 0;
     }
-    free(ivars);
-
-    NSMutableArray *sub = [NSMutableArray array];
-    UIView *cellView = (UIView *)cell;
-    for (UIView *v in cellView.subviews) {
-        if ([v isKindOfClass:[UILabel class]]) {
-            UILabel *l = (UILabel *)v;
-            NSString *txt = l.text.length ? l.text : l.attributedText.string;
-            NSString *head = txt.length ? [txt substringToIndex:MIN(12, txt.length)] : @"";
-            [sub addObject:[NSString stringWithFormat:@"subL lines=%ld brk=%ld w=%.0f t=%@",
-                            (long)l.numberOfLines, (long)l.lineBreakMode, l.bounds.size.width, head]];
-        }
+    NSString *text = label.text.length ? label.text : label.attributedText.string;
+    if (text.length == 0) {
+        return 0;
     }
+    CGFloat labelWidth = label.bounds.size.width;
+    if (labelWidth <= 1.0) labelWidth = width;
+    if (labelWidth <= 1.0) labelWidth = cell.bounds.size.width - 72.0;
+    if (labelWidth <= 1.0) return 0;
 
-    FEAddDiag([NSString stringWithFormat:@"\n[%@]\nivars:\n%@\nsubviews:\n%@",
-               NSStringFromClass([cell class]),
-               [out componentsJoinedByString:@"\n"],
-               [sub componentsJoinedByString:@"\n"]]);
+    if (label.numberOfLines != 0) label.numberOfLines = 0;
+    label.preferredMaxLayoutWidth = labelWidth;
+
+    CGFloat wanted = ceil([label sizeThatFits:CGSizeMake(labelWidth, CGFLOAT_MAX)].height);
+    CGFloat current = label.font.lineHeight;
+    CGFloat delta = wanted - current;
+    return delta > 0.5 && delta < 200.0 ? delta : 0;
 }
 
-#pragma mark - List cell
-
-static void (*orig_listLayout)(id, SEL);
-static void (*orig_listWindow)(id, SEL);
-static void (*orig_listConfig)(id, SEL, id);
-static void (*orig_listReuse)(id, SEL);
-static CGSize (*orig_listSizing)(id, SEL, CGSize, float, float);
-
-static void FEApplyList(id cell)
+static void FECellLayout(id self, SEL _cmd)
 {
-    FEDumpCell(cell);
+    orig_cellLayout(self, _cmd);
     if (!gPrefs.enabled) {
         return;
     }
-    UILabel *label = FEListTitleLabel(cell);
-    if (!label) {
-        return;
-    }
-    if (!gPrefs.shrink) {
-        CGFloat width = label.bounds.size.width;
-        if (width > 1.0 && fabs(label.preferredMaxLayoutWidth - width) > 0.5) {
-            label.preferredMaxLayoutWidth = width;
+    UIView *cell = (UIView *)self;
+    NSMutableArray<UILabel *> *labels = [NSMutableArray array];
+    FECollectLabels(cell, labels, 0);
+    for (UILabel *label in labels) {
+        if (label.numberOfLines == 1 && FEIsInsideCell(label)) {
+            FEConfigureLabel(label);
         }
     }
-    FEConfigureLabel(label, gPrefs.listMaxLines);
 }
 
-static void FEListLayout(id self, SEL _cmd)
+static id FEPreferredAttrs(id self, SEL _cmd, id attributes)
 {
-    FEApplyList(self);
-    orig_listLayout(self, _cmd);
-    FEApplyList(self);
+    id result = orig_preferredAttrs(self, _cmd, attributes);
+    if (!gPrefs.enabled || !gPrefs.resizeRows || gPrefs.shrink) {
+        return result;
+    }
+    UIView *cell = (UIView *)self;
+    CGFloat delta = FEHeightDelta(cell, cell.bounds.size.width);
+    if (delta > 0 && [result isKindOfClass:[UICollectionViewLayoutAttributes class]]) {
+        UICollectionViewLayoutAttributes *attrs = result;
+        CGRect frame = attrs.frame;
+        frame.size.height += delta;
+        attrs.frame = frame;
+        attrs.size = frame.size;
+    }
+    return result;
 }
 
-static void FEListWindow(id self, SEL _cmd)
+static CGSize FECellSizing(id self, SEL _cmd, CGSize size, float hPriority, float vPriority)
 {
-    orig_listWindow(self, _cmd);
-    FEApplyList(self);
-}
-
-static void FEListConfig(id self, SEL _cmd, id state)
-{
-    orig_listConfig(self, _cmd, state);
-    FEApplyList(self);
-}
-
-static void FEListReuse(id self, SEL _cmd)
-{
-    orig_listReuse(self, _cmd);
-    FEApplyList(self);
-}
-
-static CGSize FEListSizing(id self, SEL _cmd, CGSize size, float hPriority, float vPriority)
-{
-    CGSize base = orig_listSizing(self, _cmd, size, hPriority, vPriority);
+    CGSize base = orig_cellSizing(self, _cmd, size, hPriority, vPriority);
     if (!gPrefs.enabled || !gPrefs.resizeRows || gPrefs.shrink) {
         return base;
     }
-    UILabel *label = FEListTitleLabel(self);
-    if (!label || label.text.length == 0) {
-        return base;
-    }
-
-    CGFloat width = label.bounds.size.width;
-    if (width <= 1.0) {
-        CGFloat cellWidth = size.width > 1.0 ? size.width : ((UIView *)self).bounds.size.width;
-        width = MAX(cellWidth - 72.0, 0);
-    }
-    if (width <= 1.0) {
-        return base;
-    }
-
-    label.preferredMaxLayoutWidth = width;
-    CGFloat wanted = ceil([label sizeThatFits:CGSizeMake(width, CGFLOAT_MAX)].height);
-    CGFloat current = label.bounds.size.height > 0 ? label.bounds.size.height : ceil(label.font.lineHeight);
-    if (wanted - current > 0.5) {
-        base.height += wanted - current;
+    CGFloat delta = FEHeightDelta((UIView *)self, size.width);
+    if (delta > 0) {
+        base.height += delta;
     }
     return base;
-}
-
-#pragma mark - Grid cell
-
-static void (*orig_gridLayout)(id, SEL);
-static void (*orig_gridWindow)(id, SEL);
-static void (*orig_gridConfig)(id, SEL, id);
-static void (*orig_gridReuse)(id, SEL);
-
-static void FEApplyGrid(id cell)
-{
-    FEDumpCell(cell);
-    if (!gPrefs.enabled || !gPrefs.gridEnabled) {
-        return;
-    }
-    FEConfigureLabel(FEGridTitleLabel(cell), gPrefs.gridMaxLines);
-}
-
-static void FEGridLayout(id self, SEL _cmd)
-{
-    FEApplyGrid(self);
-    orig_gridLayout(self, _cmd);
-    FEApplyGrid(self);
-}
-
-static void FEGridWindow(id self, SEL _cmd)
-{
-    orig_gridWindow(self, _cmd);
-    FEApplyGrid(self);
-}
-
-static void FEGridConfig(id self, SEL _cmd, id state)
-{
-    orig_gridConfig(self, _cmd, state);
-    FEApplyGrid(self);
-}
-
-static void FEGridReuse(id self, SEL _cmd)
-{
-    orig_gridReuse(self, _cmd);
-    FEApplyGrid(self);
 }
 
 #pragma mark - Load confirmation
 
 static void FEShowAlert(NSString *message)
 {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *window = nil;
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
             for (UIWindow *candidate in ((UIWindowScene *)scene).windows) {
-                if (candidate.isKeyWindow) {
-                    window = candidate;
-                    break;
-                }
+                if (candidate.isKeyWindow) { window = candidate; break; }
             }
             if (window) break;
         }
@@ -485,36 +348,12 @@ static void FEShowAlert(NSString *message)
 
 __attribute__((constructor)) static void FEInitialize(void)
 {
-    FELog(@"loaded (v0.0.9)");
+    FELog(@"loaded (v0.0.10)");
     FELoadPrefs();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, FEPrefsChanged,
                                     (__bridge CFStringRef)kReloadNotification, NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
-
-    Class listCell = FEClassWithNames(@[@"_TtC5Files25DOCItemCollectionListCell",
-                                        @"Files.DOCItemCollectionListCell",
-                                        @"DOCItemCollectionListCell"]);
-    Class gridCell = FEClassWithNames(@[@"_TtC5Files25DOCItemCollectionGridCell",
-                                        @"Files.DOCItemCollectionGridCell",
-                                        @"DOCItemCollectionGridCell"]);
-
-    unsigned int classCount = 0;
-    Class *classes = objc_copyClassList(&classCount);
-    NSMutableArray *hits = [NSMutableArray array];
-    for (unsigned i = 0; i < classCount; i++) {
-        NSString *n = NSStringFromClass(classes[i]);
-        if ([n containsString:@"DOC"] || [n containsString:@"CollectionList"] ||
-            [n containsString:@"CollectionGrid"] || [n containsString:@"ItemCell"]) {
-            [hits addObject:n];
-        }
-    }
-    free(classes);
-    FEAddDiag([NSString stringWithFormat:@"\nloaded cell classes: %@", hits]);
-
-    FELog(@"classes: list=%@ grid=%@",
-          listCell ? NSStringFromClass(listCell) : @"(nil)",
-          gridCell ? NSStringFromClass(gridCell) : @"(nil)");
 
     Class labelClass = [UILabel class];
     FEHook(labelClass, @selector(setLineBreakMode:), (void *)&FESetLineBreakMode,
@@ -524,29 +363,17 @@ __attribute__((constructor)) static void FEInitialize(void)
     FEHook(labelClass, @selector(setAttributedText:), (void *)&FESetAttributedText,
            (void **)&orig_setAttributedText, @"label");
 
-    if (listCell) {
-        FEHook(listCell, @selector(layoutSubviews), (void *)&FEListLayout, (void **)&orig_listLayout, @"list");
-        FEHook(listCell, @selector(didMoveToWindow), (void *)&FEListWindow, (void **)&orig_listWindow, @"list");
-        FEHook(listCell, @selector(_bridgedUpdateConfigurationUsingState:), (void *)&FEListConfig,
-               (void **)&orig_listConfig, @"list");
-        FEHook(listCell, @selector(prepareForReuse), (void *)&FEListReuse, (void **)&orig_listReuse, @"list");
-        FEHook(listCell, @selector(systemLayoutSizeFittingSize:withHorizontalFittingPriority:verticalFittingPriority:),
-               (void *)&FEListSizing, (void **)&orig_listSizing, @"list");
-    }
-    if (gridCell) {
-        FEHook(gridCell, @selector(layoutSubviews), (void *)&FEGridLayout, (void **)&orig_gridLayout, @"grid");
-        FEHook(gridCell, @selector(didMoveToWindow), (void *)&FEGridWindow, (void **)&orig_gridWindow, @"grid");
-        FEHook(gridCell, @selector(_bridgedUpdateConfigurationUsingState:), (void *)&FEGridConfig,
-               (void **)&orig_gridConfig, @"grid");
-        FEHook(gridCell, @selector(prepareForReuse), (void *)&FEGridReuse, (void **)&orig_gridReuse, @"grid");
+    Class cellClass = NSClassFromString(@"UICollectionViewCell");
+    if (cellClass) {
+        FEHook(cellClass, @selector(layoutSubviews), (void *)&FECellLayout,
+               (void **)&orig_cellLayout, @"cell");
+        FEHook(cellClass, @selector(preferredLayoutAttributesFittingAttributes:),
+               (void *)&FEPreferredAttrs, (void **)&orig_preferredAttrs, @"cell");
+        FEHook(cellClass, @selector(systemLayoutSizeFittingSize:withHorizontalFittingPriority:verticalFittingPriority:),
+               (void *)&FECellSizing, (void **)&orig_cellSizing, @"cell");
     }
 
     if (gPrefs.showAlert) {
-        NSString *diag = gDiag ?: @"";
-        if (diag.length > 1500) diag = [diag substringToIndex:1500];
-        FEShowAlert([NSString stringWithFormat:@"插件已加载\nlistCell = %@\ngridCell = %@\n---\n%@",
-                     listCell ? NSStringFromClass(listCell) : @"未找到",
-                     gridCell ? NSStringFromClass(gridCell) : @"未找到",
-                     diag]);
+        FEShowAlert([NSString stringWithFormat:@"插件已加载 (0.0.10)\n已处理标签数：%lu", (unsigned long)gConfiguredCount]);
     }
 }
