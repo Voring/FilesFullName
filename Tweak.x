@@ -5,13 +5,14 @@
 //  iOS 15 / 16, com.apple.DocumentsApp, arm64e (RootHide / rootless).
 //
 //  Design notes:
-//  - Never touch Swift ivars; everything is found by walking the view tree.
-//  - No UICollectionViewCell hooks at all: mutating views inside layoutSubviews
-//    made Files' Swift list cell hit an assertion and crash.
-//  - Only wide list-row title labels (> 200pt) are rewritten, by intercepting
-//    the UILabel setters, so the grid / icon view is untouched.
+//  - Never touch Swift ivars; every element is found by walking the view tree.
+//  - No layoutSubviews hook: mutating views there made the Swift list cell
+//    hit an assertion and crash. Row growth uses the two sizing methods only.
+//  - Only two surfaces are touched: list/grid cell title labels, and the
+//    center filename under the large preview icon. Everything else keeps the
+//    system layout.
 //  - File-type icons are clamped back to square size off the layout pass.
-//  - No load alert: the tweak stays silent.
+//  - Silent load: no alert.
 //
 
 #import <UIKit/UIKit.h>
@@ -23,18 +24,18 @@ static NSString *const kPrefsDomain = @"com.voring.filesfullname";
 static NSString *const kReloadNotification = @"com.voring.filesfullname.reload";
 static NSString *const kPrefsFile = @"/var/mobile/Library/Preferences/com.voring.filesfullname.plist";
 
-/// Only rows with a label at least this wide count as list rows.
 static const CGFloat FEWideLabelMinWidth = 200.0;
 
 typedef struct {
     BOOL enabled;
     BOOL shrink;
     BOOL wrap;
+    BOOL resizeRows;
     BOOL keepIconSize;
     NSInteger maxLines;
 } FEPrefs;
 
-static FEPrefs gPrefs = {YES, NO, YES, YES, 0};
+static FEPrefs gPrefs = {YES, NO, YES, YES, YES, 0};
 
 #pragma mark - Preferences
 
@@ -75,6 +76,7 @@ static void FELoadPrefs(void)
     gPrefs.enabled = FEPrefBool(@"Enabled", YES);
     gPrefs.shrink = FEPrefBool(@"ShrinkToFit", NO);
     gPrefs.wrap = FEPrefBool(@"WrapLines", YES);
+    gPrefs.resizeRows = FEPrefBool(@"ResizeRows", YES);
     gPrefs.keepIconSize = FEPrefBool(@"KeepIconSize", YES);
     gPrefs.maxLines = FEPrefInt(@"ListMaxLines", 0);
     if (gPrefs.maxLines < 0) gPrefs.maxLines = 0;
@@ -133,9 +135,74 @@ static CGFloat FELabelWidth(UILabel *label)
     return width;
 }
 
-static BOOL FEIsWideListLabel(UILabel *label)
+static BOOL FEIsNavAncestor(UIView *view)
 {
-    return FEEnclosingCell(label) != nil && FELabelWidth(label) >= FEWideLabelMinWidth;
+    UIView *current = view;
+    for (NSInteger depth = 0; current && depth < 12; depth++, current = current.superview) {
+        NSString *name = NSStringFromClass([current class]);
+        if ([name containsString:@"NavigationBar"] || [name containsString:@"NavBar"] ||
+            [name containsString:@"Toolbar"] || [name containsString:@"TabBar"] ||
+            [name containsString:@"Button"]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+/// Preview/detail page: the filename sits directly under a large file icon.
+/// Look up a few superview levels for an icon big enough to be the preview art.
+static BOOL FEHasLargeIconNearby(UILabel *label)
+{
+    UIView *container = label.superview;
+    for (NSInteger depth = 0; container && depth < 4; depth++, container = container.superview) {
+        NSMutableArray<UIImageView *> *icons = [NSMutableArray array];
+        FECollectViews(container, [UIImageView class], icons, 0);
+        for (UIImageView *icon in icons) {
+            CGFloat w = icon.bounds.size.width > 1.0 ? icon.bounds.size.width : icon.frame.size.width;
+            CGFloat h = icon.bounds.size.height > 1.0 ? icon.bounds.size.height : icon.frame.size.height;
+            if (w > 60.0 && h > 60.0) return YES;
+        }
+    }
+    return NO;
+}
+
+/// Only two surfaces are touched:
+///  1. title labels inside list/grid cells (file listing)
+///  2. the center filename under the large preview icon
+/// Everything else (sidebar, search, share sheet, subtitles, nav title) keeps
+/// the system layout.
+static BOOL FEIsManagedLabel(UILabel *label)
+{
+    if (FEIsNavAncestor(label)) return NO;
+    CGFloat width = FELabelWidth(label);
+
+    if (FEEnclosingCell(label)) {
+        return width <= 1.0 || width >= FEWideLabelMinWidth;
+    }
+    // Detail / preview center filename: must be near a large icon.
+    if (!FEHasLargeIconNearby(label)) return NO;
+    return width <= 1.0 || width >= 120.0;
+}
+
+static UILabel *FETitleLabel(UIView *cell)
+{
+    NSMutableArray<UILabel *> *labels = [NSMutableArray array];
+    FECollectViews(cell, [UILabel class], labels, 0);
+
+    UILabel *best = nil;
+    CGFloat bestWidth = 0;
+    for (UILabel *label in labels) {
+        if (label.hidden || label.alpha < 0.05) continue;
+        NSString *text = label.text.length ? label.text : label.attributedText.string;
+        if (text.length == 0) continue;
+        CGFloat width = FELabelWidth(label);
+        if (width > 1.0 && width < FEWideLabelMinWidth) continue;
+        if (width > bestWidth) {
+            bestWidth = width;
+            best = label;
+        }
+    }
+    return best;
 }
 
 static NSAttributedString *PERewrite(NSAttributedString *attributed, NSLineBreakMode mode)
@@ -177,7 +244,6 @@ static void FEClampIconSize(UIView *cell)
     }
 }
 
-/// Runs after the current layout pass finishes, so no assertion can be tripped.
 static void FEScheduleIconClamp(UILabel *label)
 {
     static const void *kPendingKey = &kPendingKey;
@@ -230,7 +296,7 @@ static void FESetLineBreakMode(id self, SEL _cmd, NSLineBreakMode mode)
 {
     orig_setLineBreakMode(self, _cmd, mode);
     if (mode == NSLineBreakByTruncatingMiddle && gPrefs.enabled && !gPrefs.shrink &&
-        FEIsWideListLabel((UILabel *)self)) {
+        FEIsManagedLabel((UILabel *)self)) {
         FEConfigureLabel((UILabel *)self);
     }
 }
@@ -239,24 +305,75 @@ static void FESetNumberOfLines(id self, SEL _cmd, NSInteger lines)
 {
     orig_setNumberOfLines(self, _cmd, lines);
     if (lines == 1 && gPrefs.enabled && !gPrefs.shrink && gPrefs.wrap &&
-        FEIsWideListLabel((UILabel *)self)) {
+        FEIsManagedLabel((UILabel *)self)) {
         FEConfigureLabel((UILabel *)self);
     }
 }
 
 static void FESetAttributedText(id self, SEL _cmd, NSAttributedString *text)
 {
-    if (gPrefs.enabled && !gPrefs.shrink && text.length && FEIsWideListLabel((UILabel *)self)) {
+    if (gPrefs.enabled && !gPrefs.shrink && text.length && FEIsManagedLabel((UILabel *)self)) {
         text = PERewrite(text, NSLineBreakByCharWrapping);
     }
     orig_setAttributedText(self, _cmd, text);
+}
+
+#pragma mark - Cell sizing only (no layoutSubviews)
+
+static id (*orig_preferredAttrs)(id, SEL, id);
+static CGSize (*orig_cellSizing)(id, SEL, CGSize, float, float);
+
+static CGFloat FEHeightDelta(UIView *cell, CGFloat fallbackWidth)
+{
+    if (!gPrefs.enabled || !gPrefs.resizeRows || gPrefs.shrink) return 0;
+
+    UILabel *label = FETitleLabel(cell);
+    if (!label) return 0;
+
+    NSString *text = label.text.length ? label.text : label.attributedText.string;
+    if (text.length == 0) return 0;
+
+    CGFloat width = FELabelWidth(label);
+    if (width < FEWideLabelMinWidth) width = fallbackWidth;
+    if (width < FEWideLabelMinWidth) return 0;
+
+    if (label.numberOfLines != 0) label.numberOfLines = 0;
+    label.preferredMaxLayoutWidth = width;
+
+    CGFloat wanted = ceil([label sizeThatFits:CGSizeMake(width, CGFLOAT_MAX)].height);
+    CGFloat current = label.font.lineHeight;
+    CGFloat delta = wanted - current;
+    return (delta > 0.5 && delta < 200.0) ? delta : 0;
+}
+
+static id FEPreferredAttrs(id self, SEL _cmd, id attributes)
+{
+    id result = orig_preferredAttrs(self, _cmd, attributes);
+    UIView *cell = (UIView *)self;
+    CGFloat delta = FEHeightDelta(cell, cell.bounds.size.width);
+    if (delta > 0 && [result isKindOfClass:[UICollectionViewLayoutAttributes class]]) {
+        UICollectionViewLayoutAttributes *attrs = result;
+        CGRect frame = attrs.frame;
+        frame.size.height += delta;
+        attrs.frame = frame;
+        attrs.size = frame.size;
+    }
+    return result;
+}
+
+static CGSize FECellSizing(id self, SEL _cmd, CGSize size, float hPriority, float vPriority)
+{
+    CGSize base = orig_cellSizing(self, _cmd, size, hPriority, vPriority);
+    CGFloat delta = FEHeightDelta((UIView *)self, size.width);
+    if (delta > 0) base.height += delta;
+    return base;
 }
 
 #pragma mark - Install
 
 __attribute__((constructor)) static void FEInitialize(void)
 {
-    FELog(@"loaded (v0.0.11)");
+    FELog(@"loaded (v0.0.12)");
     FELoadPrefs();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, FEPrefsChanged,
@@ -270,4 +387,12 @@ __attribute__((constructor)) static void FEInitialize(void)
            (void **)&orig_setNumberOfLines, @"label");
     FEHook(labelClass, @selector(setAttributedText:), (void *)&FESetAttributedText,
            (void **)&orig_setAttributedText, @"label");
+
+    Class cellClass = NSClassFromString(@"UICollectionViewCell");
+    if (cellClass) {
+        FEHook(cellClass, @selector(preferredLayoutAttributesFittingAttributes:),
+               (void *)&FEPreferredAttrs, (void **)&orig_preferredAttrs, @"cell");
+        FEHook(cellClass, @selector(systemLayoutSizeFittingSize:withHorizontalFittingPriority:verticalFittingPriority:),
+               (void *)&FECellSizing, (void **)&orig_cellSizing, @"cell");
+    }
 }

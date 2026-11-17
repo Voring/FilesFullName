@@ -77,15 +77,15 @@ jobs:
         if: success() && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.0.11
-          name: FilesFullName 0.0.11
+          tag_name: v0.0.12
+          name: FilesFullName 0.0.12
           body: |
             arm64e / roothide（RootHide、Dopamine）构建，iOS 15-16。
 
-            - 修复切到图标（网格）视图闪退：不再在 UICollectionViewCell 的布局回调里改视图
-            - 修复文件图标被多行文件名拉高：图标异步钳制回方形尺寸
-            - 长文件名按字符换行，仅作用于宽列表行，网格视图不受影响
-            - 移除开屏注入成功弹窗，加载时完全静默
+            - 只改两处：文件列表里的文件名、详情页大图标下方的中间文件名
+            - 其余界面（侧栏、搜索、分享面板、副标题、顶部导航标题）保持系统原样
+            - 长文件名按字符换行；列表行高由尺寸方法补差值，图标钳制回方形
+            - 加载静默，无弹窗
             - 偏好键：Enabled / ShrinkToFit / WrapLines / KeepIconSize / ListMaxLines
           files: packages/*.deb
           fail_on_unmatched_files: true
