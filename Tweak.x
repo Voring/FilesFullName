@@ -150,14 +150,17 @@ static BOOL FEIsNavAncestor(UIView *view)
 }
 
 /// Preview/detail page: the filename sits directly under a large file icon.
-/// Look up a few superview levels for an icon big enough to be the preview art.
+/// The icon may be a plain UIView subclass rather than a UIImageView, so count
+/// any large non-label leaf view within a few superview levels.
 static BOOL FEHasLargeIconNearby(UILabel *label)
 {
     UIView *container = label.superview;
     for (NSInteger depth = 0; container && depth < 4; depth++, container = container.superview) {
-        NSMutableArray<UIImageView *> *icons = [NSMutableArray array];
-        FECollectViews(container, [UIImageView class], icons, 0);
-        for (UIImageView *icon in icons) {
+        NSMutableArray<UIView *> *icons = [NSMutableArray array];
+        FECollectViews(container, [UIView class], icons, 0);
+        for (UIView *icon in icons) {
+            if ([icon isKindOfClass:[UILabel class]]) continue;
+            if (icon.subviews.count > 0) continue;
             CGFloat w = icon.bounds.size.width > 1.0 ? icon.bounds.size.width : icon.frame.size.width;
             CGFloat h = icon.bounds.size.height > 1.0 ? icon.bounds.size.height : icon.frame.size.height;
             if (w > 60.0 && h > 60.0) return YES;
@@ -227,20 +230,56 @@ static NSAttributedString *PERewrite(NSAttributedString *attributed, NSLineBreak
 
 #pragma mark - Icon size
 
+static void FEMakeSquare(UIView *icon)
+{
+    CGRect frame = icon.frame;
+    if (!(frame.size.height > frame.size.width + 1.0 && frame.size.width > 8.0)) return;
+
+    CGFloat centerY = CGRectGetMidY(frame);
+    frame.size.height = frame.size.width;
+    frame.origin.y = centerY - frame.size.height / 2.0;
+    icon.frame = frame;
+
+    // Autolayout would stretch the icon again on the next pass: drop any
+    // height constraint pinned to the icon and add an equal-width constraint.
+    NSMutableArray<NSLayoutConstraint *> *heightConstraints = [NSMutableArray array];
+    for (NSLayoutConstraint *c in icon.constraints) {
+        if (c.firstItem == icon && c.firstAttribute == NSLayoutAttributeHeight) {
+            [heightConstraints addObject:c];
+        }
+    }
+    for (NSLayoutConstraint *c in icon.superview.constraints) {
+        BOOL pinsIconHeight = (c.firstItem == icon && c.firstAttribute == NSLayoutAttributeHeight) ||
+                              (c.secondItem == icon && c.secondAttribute == NSLayoutAttributeHeight);
+        if (pinsIconHeight) [heightConstraints addObject:c];
+    }
+    for (NSLayoutConstraint *c in heightConstraints) {
+        if (c.firstItem == icon) {
+            [icon removeConstraint:c];
+        } else {
+            [icon.superview removeConstraint:c];
+        }
+    }
+
+    NSLayoutConstraint *square = [NSLayoutConstraint constraintWithItem:icon
+                                                              attribute:NSLayoutAttributeWidth
+                                                              relatedBy:NSLayoutRelationEqual
+                                                                 toItem:icon
+                                                              attribute:NSLayoutAttributeHeight
+                                                             multiplier:1.0 constant:0];
+    square.active = YES;
+}
+
 static void FEClampIconSize(UIView *cell)
 {
     if (!gPrefs.keepIconSize || !cell) return;
 
-    NSMutableArray<UIImageView *> *icons = [NSMutableArray array];
-    FECollectViews(cell, [UIImageView class], icons, 0);
-    for (UIImageView *icon in icons) {
-        CGRect frame = icon.frame;
-        if (frame.size.height > frame.size.width + 1.0 && frame.size.width > 8.0) {
-            CGFloat centerY = CGRectGetMidY(frame);
-            frame.size.height = frame.size.width;
-            frame.origin.y = centerY - frame.size.height / 2.0;
-            icon.frame = frame;
-        }
+    NSMutableArray<UIView *> *icons = [NSMutableArray array];
+    FECollectViews(cell, [UIView class], icons, 0);
+    for (UIView *icon in icons) {
+        if ([icon isKindOfClass:[UILabel class]]) continue;
+        if (icon.subviews.count > 0) continue;
+        FEMakeSquare(icon);
     }
 }
 
@@ -273,6 +312,7 @@ static void FEConfigureLabel(UILabel *label)
     if (singleLine && label.minimumScaleFactor < 0.4) label.minimumScaleFactor = 0.4;
 
     CGFloat width = FELabelWidth(label);
+    if (width <= 1.0) width = label.superview.bounds.size.width;
     if (width > 1.0 && fabs(label.preferredMaxLayoutWidth - width) > 0.5) {
         label.preferredMaxLayoutWidth = width;
     }
@@ -291,6 +331,7 @@ static void FEConfigureLabel(UILabel *label)
 static void (*orig_setLineBreakMode)(id, SEL, NSLineBreakMode);
 static void (*orig_setNumberOfLines)(id, SEL, NSInteger);
 static void (*orig_setAttributedText)(id, SEL, NSAttributedString *);
+static void (*orig_setText)(id, SEL, NSString *);
 
 static void FESetLineBreakMode(id self, SEL _cmd, NSLineBreakMode mode)
 {
@@ -316,6 +357,14 @@ static void FESetAttributedText(id self, SEL _cmd, NSAttributedString *text)
         text = PERewrite(text, NSLineBreakByCharWrapping);
     }
     orig_setAttributedText(self, _cmd, text);
+}
+
+static void FESetText(id self, SEL _cmd, NSString *text)
+{
+    orig_setText(self, _cmd, text);
+    if (gPrefs.enabled && !gPrefs.shrink && text.length && FEIsManagedLabel((UILabel *)self)) {
+        FEConfigureLabel((UILabel *)self);
+    }
 }
 
 #pragma mark - Cell sizing only (no layoutSubviews)
@@ -373,7 +422,7 @@ static CGSize FECellSizing(id self, SEL _cmd, CGSize size, float hPriority, floa
 
 __attribute__((constructor)) static void FEInitialize(void)
 {
-    FELog(@"loaded (v0.0.12)");
+    FELog(@"loaded (v0.0.13)");
     FELoadPrefs();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, FEPrefsChanged,
@@ -387,6 +436,8 @@ __attribute__((constructor)) static void FEInitialize(void)
            (void **)&orig_setNumberOfLines, @"label");
     FEHook(labelClass, @selector(setAttributedText:), (void *)&FESetAttributedText,
            (void **)&orig_setAttributedText, @"label");
+    FEHook(labelClass, @selector(setText:), (void *)&FESetText,
+           (void **)&orig_setText, @"label");
 
     Class cellClass = NSClassFromString(@"UICollectionViewCell");
     if (cellClass) {
