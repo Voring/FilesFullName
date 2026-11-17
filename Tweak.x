@@ -6,10 +6,10 @@
 //
 //  Design notes:
 //  - Never touch Swift ivars; every element is found by walking the view tree.
-//  - No layoutSubviews hook on cells and no constraint surgery: the first
-//    crashed the Swift list cell, the second collapsed the icons.
-//  - Icons keep their natural size by aspect-fitting at layout time, because a
-//    wrapped row makes the image view's frame taller.
+//  - No layoutSubviews hook on cells and no constraint surgery.
+//  - Label setters are hooked, and a post-layout rescan of the visible window
+//    covers labels whose text/icon were laid out after the setter ran.
+//  - Icons keep their natural size by aspect-fitting at layout time.
 //  - Only two surfaces are touched: list cell title labels and the center
 //    filename under the large preview artwork.
 //  - Silent load: no alert.
@@ -23,6 +23,7 @@
 static NSString *const kPrefsDomain = @"com.voring.filesfullname";
 static NSString *const kReloadNotification = @"com.voring.filesfullname.reload";
 static NSString *const kPrefsFile = @"/var/mobile/Library/Preferences/com.voring.filesfullname.plist";
+static NSString *const kTreeDumpFile = @"/var/mobile/Library/Preferences/com.voring.filesfullname.tree.txt";
 
 static const CGFloat FEWideLabelMinWidth = 200.0;
 
@@ -123,7 +124,7 @@ static UIView *FEEnclosingCell(UIView *view)
 
 static void FECollectViews(UIView *view, Class cls, NSMutableArray *into, NSInteger depth)
 {
-    if (!view || depth > 10) return;
+    if (!view || depth > 12) return;
     if ([view isKindOfClass:cls]) [into addObject:view];
     for (UIView *child in view.subviews) FECollectViews(child, cls, into, depth + 1);
 }
@@ -149,12 +150,12 @@ static BOOL FEIsNavAncestor(UIView *view)
 }
 
 /// Preview/detail page: the filename sits directly under a large file icon.
-/// The artwork may be a plain UIView or a composite view, so accept any large
-/// non-label, non-scroller view within a few superview levels.
+/// Walk all the way up to the window; the icon may be several levels away and
+/// its frame may only be laid out after the label's setter ran.
 static BOOL FEHasLargeIconNearby(UILabel *label)
 {
     UIView *container = label.superview;
-    for (NSInteger depth = 0; container && depth < 4; depth++, container = container.superview) {
+    for (NSInteger depth = 0; container && depth < 8; depth++, container = container.superview) {
         NSMutableArray<UIView *> *icons = [NSMutableArray array];
         FECollectViews(container, [UIView class], icons, 0);
         for (UIView *icon in icons) {
@@ -182,8 +183,8 @@ static BOOL FEIsManagedLabel(UILabel *label)
     if (FEIsNavAncestor(label)) return NO;
     CGFloat width = FELabelWidth(label);
 
-    // Detail / preview center filename: its cell can be narrower than a list
-    // row, so the list-row width gate must not apply here.
+    // Detail / preview center filename: its container can be narrower than a
+    // list row, so the list-row width gate must not apply here.
     if (FEHasLargeIconNearby(label)) {
         return width <= 1.0 || width >= 100.0;
     }
@@ -239,7 +240,8 @@ static NSAttributedString *PERewrite(NSAttributedString *attributed, NSLineBreak
 
 /// Keep the icon at its natural size without touching any constraint. A
 /// stretched image view switches to aspect-fit, which draws the artwork at the
-/// shorter edge instead of stretching it.
+/// shorter edge instead of stretching it; the icon is then centered in the
+/// taller frame that the wrapped filename produced.
 static void FEKeepIconNaturalSize(UIView *icon)
 {
     if (![icon isKindOfClass:[UIImageView class]]) return;
@@ -254,30 +256,13 @@ static void FEKeepIconNaturalSize(UIView *icon)
     }
 }
 
-static void FEClampIconSize(UIView *cell)
+static void FEClampIconSize(UIView *root)
 {
-    if (!gPrefs.keepIconSize || !cell) return;
+    if (!gPrefs.keepIconSize || !root) return;
 
     NSMutableArray<UIView *> *icons = [NSMutableArray array];
-    FECollectViews(cell, [UIView class], icons, 0);
-    for (UIView *icon in icons) {
-        if ([icon isKindOfClass:[UILabel class]]) continue;
-        if (icon.subviews.count > 0) continue;
-        FEKeepIconNaturalSize(icon);
-    }
-}
-
-static void FEScheduleIconClamp(UILabel *label)
-{
-    static const void *kPendingKey = &kPendingKey;
-    UIView *cell = FEEnclosingCell(label);
-    if (!cell || objc_getAssociatedObject(cell, kPendingKey)) return;
-    objc_setAssociatedObject(cell, kPendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        objc_setAssociatedObject(cell, kPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        FEClampIconSize(cell);
-    });
+    FECollectViews(root, [UIImageView class], icons, 0);
+    for (UIView *icon in icons) FEKeepIconNaturalSize(icon);
 }
 
 #pragma mark - Label configuration
@@ -306,8 +291,61 @@ static void FEConfigureLabel(UILabel *label)
         NSAttributedString *fixed = PERewrite(text, mode);
         if (fixed != text) label.attributedText = fixed;
     }
+}
 
-    FEScheduleIconClamp(label);
+#pragma mark - Visible-window rescan
+
+static UIWindow *FEKeyWindow(void)
+{
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *window in [(UIWindowScene *)scene windows]) {
+            if (window.isKeyWindow) return window;
+        }
+    }
+    return nil;
+}
+
+static void FEDumpTree(UIView *root)
+{
+    if (!root) return;
+    NSMutableString *dump = [NSMutableString string];
+    [dump appendFormat:@"=== tree %@ ===\n", [NSDate date]];
+
+    NSMutableArray *labels = [NSMutableArray array];
+    NSMutableArray *images = [NSMutableArray array];
+    FECollectViews(root, [UILabel class], labels, 0);
+    FECollectViews(root, [UIImageView class], images, 0);
+
+    for (UILabel *label in labels) {
+        NSString *text = label.text.length ? label.text : label.attributedText.string;
+        [dump appendFormat:@"LABEL %@ frame=%@ lines=%ld mode=%ld text=%@\n",
+         NSStringFromClass([label class]),
+         NSStringFromCGRect(label.frame),
+         (long)label.numberOfLines, (long)label.lineBreakMode,
+         text.length > 80 ? [text substringToIndex:80] : text];
+    }
+    for (UIImageView *imageView in images) {
+        [dump appendFormat:@"IMAGE %@ frame=%@ mode=%ld\n",
+         NSStringFromClass([imageView class]),
+         NSStringFromCGRect(imageView.frame), (long)imageView.contentMode];
+    }
+
+    [dump writeToFile:kTreeDumpFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void FERescanVisible(void)
+{
+    UIWindow *window = FEKeyWindow();
+    if (!window) return;
+
+    NSMutableArray *labels = [NSMutableArray array];
+    FECollectViews(window, [UILabel class], labels, 0);
+    for (UILabel *label in labels) {
+        if (FEIsManagedLabel(label)) FEConfigureLabel(label);
+    }
+    FEClampIconSize(window);
+    FEDumpTree(window);
 }
 
 #pragma mark - UILabel setters
@@ -405,18 +443,25 @@ static CGSize FECellSizing(id self, SEL _cmd, CGSize size, float hPriority, floa
 #pragma mark - Install
 
 static void (*orig_imageLayout)(id, SEL);
-
 static void FEImageLayout(id self, SEL _cmd)
 {
     orig_imageLayout(self, _cmd);
-    UIImageView *imageView = (UIImageView *)self;
-    if (!FEEnclosingCell(imageView)) return;
-    FEKeepIconNaturalSize(imageView);
+    FEKeepIconNaturalSize((UIView *)self);
+}
+
+static void (*orig_viewDidAppear)(id, SEL, BOOL);
+static void FEViewDidAppear(id self, SEL _cmd, BOOL animated)
+{
+    orig_viewDidAppear(self, _cmd, animated);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        FERescanVisible();
+    });
 }
 
 __attribute__((constructor)) static void FEInitialize(void)
 {
-    FELog(@"loaded (v0.0.16)");
+    FELog(@"loaded (v0.0.17)");
     FELoadPrefs();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, FEPrefsChanged,
@@ -436,6 +481,10 @@ __attribute__((constructor)) static void FEInitialize(void)
     Class imageClass = [UIImageView class];
     FEHook(imageClass, @selector(layoutSubviews), (void *)&FEImageLayout,
            (void **)&orig_imageLayout, @"icon");
+
+    Class vcClass = [UIViewController class];
+    FEHook(vcClass, @selector(viewDidAppear:), (void *)&FEViewDidAppear,
+           (void **)&orig_viewDidAppear, @"vc");
 
     Class cellClass = NSClassFromString(@"UICollectionViewCell");
     if (cellClass) {
