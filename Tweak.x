@@ -6,12 +6,12 @@
 //
 //  Design notes:
 //  - Never touch Swift ivars; every element is found by walking the view tree.
-//  - No layoutSubviews hook, no constraint surgery: both crashed or wrecked
-//    the cell layout. Row growth uses the two sizing methods only, and icons
-//    are kept at natural size with aspect-fit.
-//  - Only two surfaces are touched: list/grid cell title labels, and the
-//    center filename under the large preview icon. Everything else keeps the
-//    system layout.
+//  - No layoutSubviews hook on cells and no constraint surgery: the first
+//    crashed the Swift list cell, the second collapsed the icons.
+//  - Icons keep their natural size by aspect-fitting at layout time, because a
+//    wrapped row makes the image view's frame taller.
+//  - Only two surfaces are touched: list cell title labels and the center
+//    filename under the large preview artwork.
 //  - Silent load: no alert.
 //
 
@@ -149,8 +149,8 @@ static BOOL FEIsNavAncestor(UIView *view)
 }
 
 /// Preview/detail page: the filename sits directly under a large file icon.
-/// The icon may be a plain UIView subclass rather than a UIImageView, so count
-/// any large non-label leaf view within a few superview levels.
+/// The artwork may be a plain UIView or a composite view, so accept any large
+/// non-label, non-scroller view within a few superview levels.
 static BOOL FEHasLargeIconNearby(UILabel *label)
 {
     UIView *container = label.superview;
@@ -159,7 +159,11 @@ static BOOL FEHasLargeIconNearby(UILabel *label)
         FECollectViews(container, [UIView class], icons, 0);
         for (UIView *icon in icons) {
             if ([icon isKindOfClass:[UILabel class]]) continue;
-            if (icon.subviews.count > 0) continue;
+            NSString *name = NSStringFromClass([icon class]);
+            if ([name containsString:@"Cell"] || [name containsString:@"Collection"] ||
+                [name containsString:@"ScrollView"] || [name containsString:@"Window"]) {
+                continue;
+            }
             CGFloat w = icon.bounds.size.width > 1.0 ? icon.bounds.size.width : icon.frame.size.width;
             CGFloat h = icon.bounds.size.height > 1.0 ? icon.bounds.size.height : icon.frame.size.height;
             if (w > 60.0 && h > 60.0) return YES;
@@ -178,12 +182,16 @@ static BOOL FEIsManagedLabel(UILabel *label)
     if (FEIsNavAncestor(label)) return NO;
     CGFloat width = FELabelWidth(label);
 
+    // Detail / preview center filename: its cell can be narrower than a list
+    // row, so the list-row width gate must not apply here.
+    if (FEHasLargeIconNearby(label)) {
+        return width <= 1.0 || width >= 100.0;
+    }
+
     if (FEEnclosingCell(label)) {
         return width <= 1.0 || width >= FEWideLabelMinWidth;
     }
-    // Detail / preview center filename: must be near a large icon.
-    if (!FEHasLargeIconNearby(label)) return NO;
-    return width <= 1.0 || width >= 120.0;
+    return NO;
 }
 
 static UILabel *FETitleLabel(UIView *cell)
@@ -229,9 +237,9 @@ static NSAttributedString *PERewrite(NSAttributedString *attributed, NSLineBreak
 
 #pragma mark - Icon size
 
-/// Keep the icon at its natural size without touching any constraint: a
-/// stretched image view switches to aspect-fit, so the artwork is drawn at its
-/// original square size and simply centered inside the taller frame.
+/// Keep the icon at its natural size without touching any constraint. A
+/// stretched image view switches to aspect-fit, which draws the artwork at the
+/// shorter edge instead of stretching it.
 static void FEKeepIconNaturalSize(UIView *icon)
 {
     if (![icon isKindOfClass:[UIImageView class]]) return;
@@ -343,7 +351,7 @@ static void FESetText(id self, SEL _cmd, NSString *text)
     }
 }
 
-#pragma mark - Cell sizing only (no layoutSubviews)
+#pragma mark - Cell sizing only (no layoutSubviews on cells)
 
 static id (*orig_preferredAttrs)(id, SEL, id);
 static CGSize (*orig_cellSizing)(id, SEL, CGSize, float, float);
@@ -396,9 +404,19 @@ static CGSize FECellSizing(id self, SEL _cmd, CGSize size, float hPriority, floa
 
 #pragma mark - Install
 
+static void (*orig_imageLayout)(id, SEL);
+
+static void FEImageLayout(id self, SEL _cmd)
+{
+    orig_imageLayout(self, _cmd);
+    UIImageView *imageView = (UIImageView *)self;
+    if (!FEEnclosingCell(imageView)) return;
+    FEKeepIconNaturalSize(imageView);
+}
+
 __attribute__((constructor)) static void FEInitialize(void)
 {
-    FELog(@"loaded (v0.0.15)");
+    FELog(@"loaded (v0.0.16)");
     FELoadPrefs();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, FEPrefsChanged,
@@ -414,6 +432,10 @@ __attribute__((constructor)) static void FEInitialize(void)
            (void **)&orig_setAttributedText, @"label");
     FEHook(labelClass, @selector(setText:), (void *)&FESetText,
            (void **)&orig_setText, @"label");
+
+    Class imageClass = [UIImageView class];
+    FEHook(imageClass, @selector(layoutSubviews), (void *)&FEImageLayout,
+           (void **)&orig_imageLayout, @"icon");
 
     Class cellClass = NSClassFromString(@"UICollectionViewCell");
     if (cellClass) {
