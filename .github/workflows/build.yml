@@ -77,15 +77,15 @@ jobs:
         if: success() && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.0.12
-          name: FilesFullName 0.0.12
+          tag_name: v0.0.13
+          name: FilesFullName 0.0.13
           body: |
             arm64e / roothide（RootHide、Dopamine）构建，iOS 15-16。
 
-            - 只改两处：文件列表里的文件名、详情页大图标下方的中间文件名
-            - 其余界面（侧栏、搜索、分享面板、副标题、顶部导航标题）保持系统原样
-            - 长文件名按字符换行；列表行高由尺寸方法补差值，图标钳制回方形
-            - 加载静默，无弹窗
+            - 列表文件名换行；图标固定原始方形尺寸（移除高度约束并加宽=高约束）
+            - 详情页大图标下方的中间文件名换行；大图标识别兼容非 UIImageView 子类
+            - 补挂 setText: 钩子，纯文本设置不会冲掉换行状态
+            - 其余界面保持系统原样；加载静默无弹窗
             - 偏好键：Enabled / ShrinkToFit / WrapLines / KeepIconSize / ListMaxLines
           files: packages/*.deb
           fail_on_unmatched_files: true
