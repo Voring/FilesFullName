@@ -22,14 +22,15 @@ jobs:
           brew install ldid xz make dpkg || true
           echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
 
-      - name: Install Theos and iPhoneOS 16.5 SDK
+      - name: Install Theos (roothide fork) and iPhoneOS 16.5 SDK
         run: |
-          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          git clone https://github.com/roothide/theos.git "$THEOS"
+          git -C "$THEOS" submodule update --init --recursive
           git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
           mkdir -p "$THEOS/sdks"
           cp -R /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
           echo "$THEOS/bin" >> "$GITHUB_PATH"
-          ls "$THEOS/makefiles" | head -5
+          ls "$THEOS/makefiles/package/schemes"
           ls "$THEOS/sdks"
 
       - name: Build package
@@ -56,6 +57,7 @@ jobs:
           if [ -n "$DYLIB" ]; then
             file "$DYLIB"
             otool -hv "$DYLIB"
+            otool -L "$DYLIB"
           fi
 
       - name: Upload deb
