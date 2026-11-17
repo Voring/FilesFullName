@@ -1,6 +1,6 @@
 Package: com.voring.filesfullname
 Name: FilesFullName
-Version: 0.0.13
+Version: 0.0.14
 Architecture: iphoneos-arm64
 Description: Shows the complete file name in the Files app instead of truncating the middle with an ellipsis.
 Maintainer: Voring

@@ -77,8 +77,8 @@ jobs:
         if: success() && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.0.13
-          name: FilesFullName 0.0.13
+          tag_name: v0.0.14
+          name: FilesFullName 0.0.14
           body: |
             arm64e / roothide（RootHide、Dopamine）构建，iOS 15-16。
 
