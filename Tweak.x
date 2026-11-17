@@ -17,10 +17,10 @@ static NSString *const kPrefsFile = @"/var/mobile/Library/Preferences/com.voring
 typedef struct {
     BOOL enabled;
     BOOL gridEnabled;
-    BOOL shrink;        // YES = 单行缩字号；NO = 多行换行
+    BOOL shrink;
     BOOL resizeRows;
     BOOL showAlert;
-    NSInteger listMaxLines;   // 0 = 不限
+    NSInteger listMaxLines;
     NSInteger gridMaxLines;
 } FEPrefs;
 
@@ -119,8 +119,9 @@ static Class FEClassWithNames(NSArray<NSString *> *names)
     return Nil;
 }
 
-/// Substrate-free hooking (works both under MobileSubstrate and TrollFools).
-static BOOL FEHook(Class cls, SEL selector, IMP replacement, IMP *original, NSString *tag)
+/// Substrate-free hooking. Pointers are taken as void * so that the many
+/// differently-typed IMPs we install never trip clang's pointer type checks.
+static BOOL FEHook(Class cls, SEL selector, void *replacement, void **original, NSString *tag)
 {
     if (!cls) {
         return NO;
@@ -130,12 +131,13 @@ static BOOL FEHook(Class cls, SEL selector, IMP replacement, IMP *original, NSSt
         FELog(@"%@ has no -%@", NSStringFromClass(cls), NSStringFromSelector(selector));
         return NO;
     }
+    IMP repl = (IMP)replacement;
     IMP previous = method_getImplementation(method);
-    if (!class_addMethod(cls, selector, replacement, method_getTypeEncoding(method))) {
-        method_setImplementation(method, replacement);
+    if (!class_addMethod(cls, selector, repl, method_getTypeEncoding(method))) {
+        method_setImplementation(method, repl);
     }
     if (original) {
-        *original = previous;
+        *original = (void *)previous;
     }
     FELog(@"hooked -%@ on %@ (%@)", NSStringFromSelector(selector), NSStringFromClass(cls), tag);
     return YES;
@@ -450,28 +452,28 @@ __attribute__((constructor)) static void FEInitialize(void)
           gridCell ? NSStringFromClass(gridCell) : @"(nil)");
 
     Class labelClass = [UILabel class];
-    FEHook(labelClass, @selector(setLineBreakMode:), (IMP)&FESetLineBreakMode,
-           (IMP *)&orig_setLineBreakMode, @"label");
-    FEHook(labelClass, @selector(setNumberOfLines:), (IMP *)&FESetNumberOfLines,
-           (IMP *)&orig_setNumberOfLines, @"label");
-    FEHook(labelClass, @selector(setAttributedText:), (IMP)&FESetAttributedText,
-           (IMP *)&orig_setAttributedText, @"label");
+    FEHook(labelClass, @selector(setLineBreakMode:), (void *)&FESetLineBreakMode,
+           (void **)&orig_setLineBreakMode, @"label");
+    FEHook(labelClass, @selector(setNumberOfLines:), (void *)&FESetNumberOfLines,
+           (void **)&orig_setNumberOfLines, @"label");
+    FEHook(labelClass, @selector(setAttributedText:), (void *)&FESetAttributedText,
+           (void **)&orig_setAttributedText, @"label");
 
     if (listCell) {
-        FEHook(listCell, @selector(layoutSubviews), (IMP)&FEListLayout, (IMP *)&orig_listLayout, @"list");
-        FEHook(listCell, @selector(didMoveToWindow), (IMP)&FEListWindow, (IMP *)&orig_listWindow, @"list");
-        FEHook(listCell, @selector(_bridgedUpdateConfigurationUsingState:), (IMP)&FEListConfig,
-               (IMP *)&orig_listConfig, @"list");
-        FEHook(listCell, @selector(prepareForReuse), (IMP)&FEListReuse, (IMP *)&orig_listReuse, @"list");
+        FEHook(listCell, @selector(layoutSubviews), (void *)&FEListLayout, (void **)&orig_listLayout, @"list");
+        FEHook(listCell, @selector(didMoveToWindow), (void *)&FEListWindow, (void **)&orig_listWindow, @"list");
+        FEHook(listCell, @selector(_bridgedUpdateConfigurationUsingState:), (void *)&FEListConfig,
+               (void **)&orig_listConfig, @"list");
+        FEHook(listCell, @selector(prepareForReuse), (void *)&FEListReuse, (void **)&orig_listReuse, @"list");
         FEHook(listCell, @selector(systemLayoutSizeFittingSize:withHorizontalFittingPriority:verticalFittingPriority:),
-               (IMP)&FEListSizing, (IMP *)&orig_listSizing, @"list");
+               (void *)&FEListSizing, (void **)&orig_listSizing, @"list");
     }
     if (gridCell) {
-        FEHook(gridCell, @selector(layoutSubviews), (IMP)&FEGridLayout, (IMP *)&orig_gridLayout, @"grid");
-        FEHook(gridCell, @selector(didMoveToWindow), (IMP)&FEGridWindow, (IMP *)&orig_gridWindow, @"grid");
-        FEHook(gridCell, @selector(_bridgedUpdateConfigurationUsingState:), (IMP)&FEGridConfig,
-               (IMP *)&orig_gridConfig, @"grid");
-        FEHook(gridCell, @selector(prepareForReuse), (IMP)&FEGridReuse, (IMP *)&orig_gridReuse, @"grid");
+        FEHook(gridCell, @selector(layoutSubviews), (void *)&FEGridLayout, (void **)&orig_gridLayout, @"grid");
+        FEHook(gridCell, @selector(didMoveToWindow), (void *)&FEGridWindow, (void **)&orig_gridWindow, @"grid");
+        FEHook(gridCell, @selector(_bridgedUpdateConfigurationUsingState:), (void *)&FEGridConfig,
+               (void **)&orig_gridConfig, @"grid");
+        FEHook(gridCell, @selector(prepareForReuse), (void *)&FEGridReuse, (void **)&orig_gridReuse, @"grid");
     }
 
     if (gPrefs.showAlert) {
