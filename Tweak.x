@@ -17,14 +17,22 @@ static NSString *const kPrefsFile = @"/var/mobile/Library/Preferences/com.voring
 typedef struct {
     BOOL enabled;
     BOOL gridEnabled;
-    BOOL shrink;
+    BOOL shrink;        // YES = 单行缩字号；NO = 多行换行
     BOOL resizeRows;
     BOOL showAlert;
-    NSInteger listMaxLines;
+    NSInteger listMaxLines;   // 0 = 不限
     NSInteger gridMaxLines;
 } FEPrefs;
 
 static FEPrefs gPrefs = {YES, YES, NO, YES, YES, 0, 2};
+
+static NSMutableString *gDiag = nil;
+static NSUInteger gDiagCellCount = 0;
+static void FEAddDiag(NSString *s)
+{
+    if (!gDiag) gDiag = [NSMutableString string];
+    [gDiag appendString:s ?: @""];
+}
 
 #pragma mark - Preferences
 
@@ -281,6 +289,48 @@ static void FESetAttributedText(id self, SEL _cmd, NSAttributedString *text)
     orig_setAttributedText(self, _cmd, text);
 }
 
+#pragma mark - Cell diagnostics
+
+static void FEDumpCell(id cell)
+{
+    if (gDiagCellCount >= 4) return;
+    gDiagCellCount++;
+
+    NSMutableArray *out = [NSMutableArray array];
+    unsigned int ivarCount = 0;
+    Ivar *ivars = class_copyIvarList(object_getClass(cell), &ivarCount);
+    for (unsigned i = 0; i < ivarCount; i++) {
+        Ivar v = ivars[i];
+        id val = object_getIvar(cell, v);
+        if ([val isKindOfClass:[UILabel class]]) {
+            UILabel *l = val;
+            NSString *txt = l.text.length ? l.text : l.attributedText.string;
+            NSString *head = txt.length ? [txt substringToIndex:MIN(12, txt.length)] : @"";
+            [out addObject:[NSString stringWithFormat:@"L[%s] lines=%ld brk=%ld w=%.0f t=%@",
+                            ivar_getName(v), (long)l.numberOfLines, (long)l.lineBreakMode,
+                            l.bounds.size.width, head]];
+        }
+    }
+    free(ivars);
+
+    NSMutableArray *sub = [NSMutableArray array];
+    UIView *cellView = (UIView *)cell;
+    for (UIView *v in cellView.subviews) {
+        if ([v isKindOfClass:[UILabel class]]) {
+            UILabel *l = (UILabel *)v;
+            NSString *txt = l.text.length ? l.text : l.attributedText.string;
+            NSString *head = txt.length ? [txt substringToIndex:MIN(12, txt.length)] : @"";
+            [sub addObject:[NSString stringWithFormat:@"subL lines=%ld brk=%ld w=%.0f t=%@",
+                            (long)l.numberOfLines, (long)l.lineBreakMode, l.bounds.size.width, head]];
+        }
+    }
+
+    FEAddDiag([NSString stringWithFormat:@"\n[%@]\nivars:\n%@\nsubviews:\n%@",
+               NSStringFromClass([cell class]),
+               [out componentsJoinedByString:@"\n"],
+               [sub componentsJoinedByString:@"\n"]]);
+}
+
 #pragma mark - List cell
 
 static void (*orig_listLayout)(id, SEL);
@@ -291,6 +341,7 @@ static CGSize (*orig_listSizing)(id, SEL, CGSize, float, float);
 
 static void FEApplyList(id cell)
 {
+    FEDumpCell(cell);
     if (!gPrefs.enabled) {
         return;
     }
@@ -370,6 +421,7 @@ static void (*orig_gridReuse)(id, SEL);
 
 static void FEApplyGrid(id cell)
 {
+    FEDumpCell(cell);
     if (!gPrefs.enabled || !gPrefs.gridEnabled) {
         return;
     }
@@ -405,7 +457,7 @@ static void FEGridReuse(id self, SEL _cmd)
 
 static void FEShowAlert(NSString *message)
 {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *window = nil;
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
@@ -433,7 +485,7 @@ static void FEShowAlert(NSString *message)
 
 __attribute__((constructor)) static void FEInitialize(void)
 {
-    FELog(@"loaded (v0.0.8)");
+    FELog(@"loaded (v0.0.9)");
     FELoadPrefs();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, FEPrefsChanged,
@@ -446,6 +498,19 @@ __attribute__((constructor)) static void FEInitialize(void)
     Class gridCell = FEClassWithNames(@[@"_TtC5Files25DOCItemCollectionGridCell",
                                         @"Files.DOCItemCollectionGridCell",
                                         @"DOCItemCollectionGridCell"]);
+
+    unsigned int classCount = 0;
+    Class *classes = objc_copyClassList(&classCount);
+    NSMutableArray *hits = [NSMutableArray array];
+    for (unsigned i = 0; i < classCount; i++) {
+        NSString *n = NSStringFromClass(classes[i]);
+        if ([n containsString:@"DOC"] || [n containsString:@"CollectionList"] ||
+            [n containsString:@"CollectionGrid"] || [n containsString:@"ItemCell"]) {
+            [hits addObject:n];
+        }
+    }
+    free(classes);
+    FEAddDiag([NSString stringWithFormat:@"\nloaded cell classes: %@", hits]);
 
     FELog(@"classes: list=%@ grid=%@",
           listCell ? NSStringFromClass(listCell) : @"(nil)",
@@ -477,8 +542,11 @@ __attribute__((constructor)) static void FEInitialize(void)
     }
 
     if (gPrefs.showAlert) {
-        FEShowAlert([NSString stringWithFormat:@"插件已加载\nlistCell = %@\ngridCell = %@",
+        NSString *diag = gDiag ?: @"";
+        if (diag.length > 1500) diag = [diag substringToIndex:1500];
+        FEShowAlert([NSString stringWithFormat:@"插件已加载\nlistCell = %@\ngridCell = %@\n---\n%@",
                      listCell ? NSStringFromClass(listCell) : @"未找到",
-                     gridCell ? NSStringFromClass(gridCell) : @"未找到"]);
+                     gridCell ? NSStringFromClass(gridCell) : @"未找到",
+                     diag]);
     }
 }
