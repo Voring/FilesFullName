@@ -10,8 +10,8 @@
 //  - Label setters are hooked, and a post-layout rescan of the visible window
 //    covers labels whose text/icon were laid out after the setter ran.
 //  - Icons keep their natural size by aspect-fitting at layout time.
-//  - Only two surfaces are touched: list cell title labels and the center
-//    filename under the large preview artwork.
+//  - Only the file listing title labels are touched; the preview center title,
+//    sidebar, search, sheet, subtitles and nav title keep the system layout.
 //  - Silent load: no alert.
 //
 
@@ -81,8 +81,8 @@ static void FELoadPrefs(void)
     gPrefs.resizeRows = FEPrefBool(@"ResizeRows", YES);
     gPrefs.keepIconSize = FEPrefBool(@"KeepIconSize", YES);
     gPrefs.dumpToDownloads = FEPrefBool(@"DumpToDownloads", YES);
-    gPrefs.maxLines = FEPrefInt(@"ListMaxLines", 0);
-    if (gPrefs.maxLines < 0) gPrefs.maxLines = 0;
+    gPrefs.maxLines = FEPrefInt(@"ListMaxLines", 2);
+    if (gPrefs.maxLines < 1) gPrefs.maxLines = 2;
 }
 
 static void FEPrefsChanged(CFNotificationCenterRef center, void *observer,
@@ -151,54 +151,19 @@ static BOOL FEIsNavAncestor(UIView *view)
     return NO;
 }
 
-/// Preview/detail page: the filename sits directly under a large file icon.
-/// Walk all the way up to the window; the icon may be several levels away and
-/// its frame may only be laid out after the label's setter ran.
-static BOOL FEHasLargeIconNearby(UILabel *label)
-{
-    UIView *container = label.superview;
-    for (NSInteger depth = 0; container && depth < 8; depth++, container = container.superview) {
-        NSMutableArray<UIView *> *icons = [NSMutableArray array];
-        FECollectViews(container, [UIView class], icons, 0);
-        for (UIView *icon in icons) {
-            if ([icon isKindOfClass:[UILabel class]]) continue;
-            NSString *name = NSStringFromClass([icon class]);
-            if ([name containsString:@"Cell"] || [name containsString:@"Collection"] ||
-                [name containsString:@"ScrollView"] || [name containsString:@"Window"]) {
-                continue;
-            }
-            CGFloat w = icon.bounds.size.width > 1.0 ? icon.bounds.size.width : icon.frame.size.width;
-            CGFloat h = icon.bounds.size.height > 1.0 ? icon.bounds.size.height : icon.frame.size.height;
-            if (w > 60.0 && h > 60.0) return YES;
-        }
-    }
-    return NO;
-}
-
-/// Only two surfaces are touched:
-///  1. title labels inside list/grid cells (file listing)
-///  2. the center filename under the large preview icon
-/// Everything else (sidebar, search, sheet, subtitles, nav title) keeps the
-/// system layout.
+/// Only the file listing title labels are touched. The preview center title,
+/// sidebar, search, sheet, subtitles and nav title keep the system layout.
 static BOOL FEIsManagedLabel(UILabel *label)
 {
     if (FEIsNavAncestor(label)) return NO;
     CGFloat width = FELabelWidth(label);
 
-    // The app's own choice is the strongest signal: only file names are drawn
-    // with a middle truncation. Wrap those wherever they live, so the preview
-    // page no longer depends on guessing its container. Narrow grid labels stay
-    // untouched so the grid keeps its cell size.
+    // File listing titles: middle truncation is the app's filename style.
+    // Narrow grid labels stay untouched so the grid keeps its cell size.
     if (label.lineBreakMode == NSLineBreakByTruncatingMiddle) {
         if (width <= 1.0) return YES;
         if (FEEnclosingCell(label) && width < 140.0) return NO;
         return width >= 60.0;
-    }
-
-    // Detail / preview center filename: its container can be narrower than a
-    // list row, so the list-row width gate must not apply here.
-    if (FEHasLargeIconNearby(label)) {
-        return width <= 1.0 || width >= 100.0;
     }
 
     if (FEEnclosingCell(label)) {
@@ -355,8 +320,6 @@ static void FEDumpTree(UIView *root)
          NSStringFromCGRect(imageView.frame), (long)imageView.contentMode];
     }
 
-    // Every non-label view that carries drawn content, so a SwiftUI or custom
-    // drawn title can be identified by class name and size.
     NSMutableArray<UIView *> *views = [NSMutableArray array];
     FECollectViews(root, [UIView class], views, 0);
     for (UIView *view in views) {
@@ -453,10 +416,12 @@ static CGFloat FEHeightDelta(UIView *cell, CGFloat fallbackWidth)
     if (width < FEWideLabelMinWidth) width = fallbackWidth;
     if (width < FEWideLabelMinWidth) return 0;
 
-    if (label.numberOfLines != 0) label.numberOfLines = 0;
+    if (label.numberOfLines != gPrefs.maxLines) label.numberOfLines = gPrefs.maxLines;
     label.preferredMaxLayoutWidth = width;
 
-    CGFloat wanted = ceil([label sizeThatFits:CGSizeMake(width, CGFLOAT_MAX)].height);
+    // Every list row reserves a two-line height; a one-line name keeps the
+    // two-line row and is vertically centered by the cell layout.
+    CGFloat wanted = ceil(2.0 * label.font.lineHeight);
     CGFloat current = label.font.lineHeight;
     CGFloat delta = wanted - current;
     return (delta > 0.5 && delta < 200.0) ? delta : 0;
@@ -506,7 +471,7 @@ static void FEViewDidAppear(id self, SEL _cmd, BOOL animated)
 
 __attribute__((constructor)) static void FEInitialize(void)
 {
-    FELog(@"loaded (v0.0.19)");
+    FELog(@"loaded (v0.0.20)");
     FELoadPrefs();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, FEPrefsChanged,
