@@ -77,16 +77,15 @@ jobs:
         if: success() && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.0.17
-          name: FilesFullName 0.0.17
+          tag_name: v0.0.20
+          name: FilesFullName 0.0.20
           body: |
             arm64e / roothide（RootHide、Dopamine）构建，iOS 15-16。
 
-            - 图标不再随行高变大：布局时对被拉高的 UIImageView 切等比缩放，按短边绘制、居中
-            - 详情页中间文件名：页面出现后按整棵视图树复查，解决设置文字时图标尚未布局、判据落空的问题
-            - 诊断：可见界面的标签/图像类名与尺寸会写入 com.voring.filesfullname.tree.txt
-            - 列表文件名换行、行高自适应保持
-            - 其余界面保持系统原样；加载静默无弹窗
+            - 仅作用于文件列表：文件名最多两行，按字符换行
+            - 单行文件名也保留两行行高，文字在行内垂直居中
+            - 左侧图标固定原始尺寸，不随行高变化
+            - 详情页、侧栏、搜索、分享面板、副标题、导航标题保持系统原样
             - 偏好键：Enabled / ShrinkToFit / WrapLines / KeepIconSize / ListMaxLines
           files: packages/*.deb
           fail_on_unmatched_files: true
